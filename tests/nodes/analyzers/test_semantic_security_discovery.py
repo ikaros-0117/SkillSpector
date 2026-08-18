@@ -356,7 +356,7 @@ class TestErrorHandling:
         """Malformed LLM response (ValidationError) must not crash the graph."""
         # Build a real ValidationError by feeding bad data to the schema
         try:
-            LLMAnalysisResult.model_validate({"findings": "not-an-array"})
+            LLMAnalysisResult.model_validate(["not", "an", "object"])
         except ValidationError as exc:
             validation_err = exc
         else:
@@ -372,7 +372,7 @@ class TestErrorHandling:
     def test_validation_error_preserves_failed_work_evidence(self) -> None:
         """Malformed responses retain both cache and submitted-batch failures."""
         try:
-            LLMAnalysisResult.model_validate({"findings": "not-an-array"})
+            LLMAnalysisResult.model_validate(["not", "an", "object"])
         except ValidationError as exc:
             validation_err = exc
         else:
@@ -426,7 +426,7 @@ class TestLLMCallTelemetry:
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_validation_error_records_ok_false(self) -> None:
         try:
-            LLMAnalysisResult.model_validate({"findings": "not-an-array"})
+            LLMAnalysisResult.model_validate(["not", "an", "object"])
         except ValidationError as exc:
             validation_err = exc
         else:

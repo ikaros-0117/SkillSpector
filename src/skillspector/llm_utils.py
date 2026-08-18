@@ -43,6 +43,7 @@ from collections.abc import Coroutine
 from typing import Any, NoReturn
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage
 from langchain_core.runnables import Runnable
 
 from skillspector.inference_usage import InferenceUsageCollector, provider_name
@@ -215,6 +216,27 @@ def _extract_json_object(raw: str) -> dict:
     )
 
 
+def _chat_response_text(response: object) -> str:
+    """Normalize a chat-model response to its text payload."""
+    if isinstance(response, BaseMessage):
+        return str(response.text)
+    content = getattr(response, "content", None)
+    if content is None:
+        raise TypeError(f"Expected a chat response with text, got {type(response).__name__}")
+    return str(content)
+
+
+def _schema_output_instructions(prompt: str, schema: type) -> str:
+    """Append the JSON Schema to *prompt* with strict single-object instructions."""
+    schema_json = json.dumps(schema.model_json_schema(), indent=2)
+    return (
+        f"{prompt}\n\n"
+        "Respond with ONLY a single JSON object conforming to the JSON Schema "
+        "below. Do not wrap it in markdown code fences and do not add any prose "
+        f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
+    )
+
+
 class _StructuredAgentCLIModel:
     """Mimics ``ChatOpenAI.with_structured_output(schema)`` for a CLI provider.
 
@@ -229,13 +251,7 @@ class _StructuredAgentCLIModel:
         self._schema = schema
 
     def _augment(self, prompt: str) -> str:
-        schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
-        return (
-            f"{prompt}\n\n"
-            "Respond with ONLY a single JSON object conforming to the JSON Schema "
-            "below. Do not wrap it in markdown code fences and do not add any prose "
-            f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
-        )
+        return _schema_output_instructions(prompt, self._schema)
 
     def _complete(self, prompt: str) -> str:
         """Return provider output before structured parsing begins."""
@@ -269,6 +285,91 @@ class _StructuredAgentCLIModel:
     ) -> object:
         """Async counterpart to :meth:`invoke_with_usage`."""
         return await asyncio.to_thread(self.invoke_with_usage, prompt, collector)
+
+
+class PromptJsonStructuredModel:
+    """Prompt-and-parse structured output backed by a raw HTTP chat model.
+
+    Appends the JSON Schema to the prompt, invokes the raw chat model (no
+    tool-calling or ``response_format`` requirements), then extracts a single
+    JSON object and validates it with the schema. Mirrors the CLI provider's
+    :class:`_StructuredAgentCLIModel` for HTTP chat models, so endpoints with
+    weak structured-output support (e.g. some OpenAI-compatible gateways) can
+    still produce validated results.
+    """
+
+    def __init__(self, chat_model: BaseChatModel, schema: type) -> None:
+        self._chat_model = chat_model
+        self._schema = schema
+
+    def _augment(self, prompt: str) -> str:
+        return _schema_output_instructions(prompt, self._schema)
+
+    def _complete(self, prompt: str) -> str:
+        """Return provider output before structured parsing begins."""
+        return _chat_response_text(self._chat_model.invoke(self._augment(prompt)))
+
+    def invoke(self, prompt: str) -> object:
+        return self._schema.model_validate(_extract_json_object(self._complete(prompt)))
+
+    async def ainvoke(self, prompt: str) -> object:
+        return await asyncio.to_thread(self.invoke, prompt)
+
+    def invoke_with_usage(
+        self,
+        prompt: str,
+        collector: InferenceUsageCollector,
+    ) -> object:
+        """Mark this invocation after transport success and before parsing."""
+        raw = _chat_response_text(self._chat_model.invoke(self._augment(prompt)))
+        collector.mark_response_received()
+        return self._schema.model_validate(_extract_json_object(raw))
+
+    async def ainvoke_with_usage(
+        self,
+        prompt: str,
+        collector: InferenceUsageCollector,
+    ) -> object:
+        """Async counterpart to :meth:`invoke_with_usage`."""
+        return await asyncio.to_thread(self.invoke_with_usage, prompt, collector)
+
+
+class PromptAugmentedStructuredModel:
+    """Augment the prompt with the JSON Schema, then delegate to a structured runnable.
+
+    Used for ``method="json_mode"``, where LangChain binds ``response_format``
+    but does not inject the schema into the prompt — without it the model has
+    to guess the output shape.
+    """
+
+    def __init__(self, runnable: Runnable, schema: type) -> None:
+        self._runnable = runnable
+        self._schema = schema
+
+    def _augment(self, prompt: str) -> str:
+        return _schema_output_instructions(prompt, self._schema)
+
+    def invoke(self, prompt: str) -> object:
+        return self._runnable.invoke(self._augment(prompt))
+
+    async def ainvoke(self, prompt: str) -> object:
+        return await self._runnable.ainvoke(self._augment(prompt))
+
+    def invoke_with_usage(
+        self,
+        prompt: str,
+        collector: InferenceUsageCollector,
+    ) -> object:
+        """Invoke the wrapped runnable with usage telemetry on the augmented prompt."""
+        return _invoke_with_usage(self._runnable, self._augment(prompt), collector)
+
+    async def ainvoke_with_usage(
+        self,
+        prompt: str,
+        collector: InferenceUsageCollector,
+    ) -> object:
+        """Async counterpart to :meth:`invoke_with_usage`."""
+        return await _ainvoke_with_usage(self._runnable, self._augment(prompt), collector)
 
 
 class AgentCLIChatModel:

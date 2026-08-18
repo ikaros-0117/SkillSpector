@@ -28,6 +28,7 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from collections import defaultdict
@@ -35,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 from langchain_anthropic import ChatAnthropic
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -49,6 +51,9 @@ from skillspector.inspection_ledger import (
     outcome_for_llm_batch_failure,
 )
 from skillspector.llm_utils import (
+    AgentCLIChatModel,
+    PromptAugmentedStructuredModel,
+    PromptJsonStructuredModel,
     StructuredOutputParseError,
     _AgentCLIMessage,
     _ainvoke_with_usage,
@@ -73,6 +78,15 @@ LLM_BATCH_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_ATTEMPTS + API_CONNECTION_MAX_R
 
 class _StructuredResponseValidationError(Exception):
     """Signal that provider output failed structured-response validation."""
+
+    def __init__(
+        self,
+        message: str = "structured response validation failed",
+        *,
+        error_class: str = "ValidationError",
+    ) -> None:
+        super().__init__(message)
+        self.error_class = error_class
 
 
 def _is_retryable_api_connection_error(exc: BaseException) -> bool:
@@ -121,6 +135,32 @@ def resolve_max_concurrency() -> int:
     return value
 
 
+STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_mode", "json_schema", "prompt_json")
+
+
+def resolve_structured_output_method() -> str | None:
+    """Resolve the structured-output method from ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD``.
+
+    Returns ``None`` when unset or invalid so callers keep the chat model's
+    native default (``ChatOpenAI`` uses ``json_schema``; other providers use
+    their own default). ``prompt_json`` is the dependency-free fallback for
+    endpoints whose tool-calling / JSON support is weak or inconsistent (e.g.
+    some OpenAI-compatible gateways): the JSON Schema is embedded in the
+    prompt, the raw completion is extracted, and the result is
+    Pydantic-validated.
+    """
+    raw = os.environ.get("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "").strip().lower()
+    if not raw:
+        return None
+    if raw not in STRUCTURED_OUTPUT_METHODS:
+        logger.warning(
+            "Invalid SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD=%r; using the provider default",
+            raw,
+        )
+        return None
+    return raw
+
+
 # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
 CHARS_PER_TOKEN = 4
 CHUNK_OVERLAP_LINES = 50
@@ -147,13 +187,19 @@ class LLMFinding(BaseModel):
     # response schema, failing the whole call. The ranges are enforced by the
     # validators below instead, so the guarantee holds without those keywords in
     # the emitted schema. start_line stays required (no default), so a finding
-    # with no location is still rejected rather than materialised at line 1;
-    # only the numeric bound is removed, not the requiredness.
+    # with the key missing is still rejected; an explicit null is materialised
+    # at line 1 by the validator below (a whole-file finding may omit the line).
     start_line: int = Field(description="Starting line number (>= 1)")
     end_line: int | None = Field(default=None, description="Ending line number (optional)")
     confidence: float = Field(default=0.5, description="Confidence score between 0.0 and 1.0")
     explanation: str = Field(default="", description="Why this is a finding (2-3 sentences)")
     remediation: str = Field(default="", description="Actionable steps to fix the issue")
+
+    @field_validator("start_line", mode="before")
+    @classmethod
+    def _coerce_start_line(cls, v: object) -> object:
+        # A whole-file finding may omit/null the line; normalise to line 1.
+        return 1 if v is None else v
 
     @field_validator("start_line")
     @classmethod
@@ -163,10 +209,30 @@ class LLMFinding(BaseModel):
         # dropping the finding over an off-by-one.
         return v if v >= 1 else 1
 
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_severity(cls, v: object) -> object:
+        # Accept case variants ("High", "high") while keeping the allowed set
+        # strict; unknown values still fail the Literal below.
+        if isinstance(v, str):
+            upper = v.strip().upper()
+            if upper in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+                return upper
+        return v
+
+    @field_validator("message", "explanation", "remediation", mode="before")
+    @classmethod
+    def _coerce_optional_text(cls, v: object) -> object:
+        # Explicit nulls from weak JSON models become empty strings instead of
+        # failing validation.
+        return "" if v is None else v
+
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
         # Accept 0-100 scale values from some models, then clamp into [0, 1].
+        if v is None:
+            return 0.5
         value = float(cast(Any, v))
         if value > 2.0:
             value = value / 100.0
@@ -191,6 +257,41 @@ class LLMAnalysisResult(BaseModel):
     """Structured LLM response containing discovered findings."""
 
     findings: list[LLMFinding] = Field(default_factory=list)
+
+    @field_validator("findings", mode="before")
+    @classmethod
+    def _coerce_findings(cls, v: object) -> object:
+        """Tolerate common near-miss shapes and keep the valid findings.
+
+        Accepts ``None``, a stringified JSON array, or a nested
+        ``{"findings": [...]}`` object, and drops individually-malformed
+        findings so one bad item does not discard the whole file's analysis.
+        """
+        if v is None:
+            return []
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except json.JSONDecodeError:
+                return []
+        if isinstance(v, dict):
+            inner = v.get("findings")
+            v = inner if isinstance(inner, list) else []
+        if not isinstance(v, list):
+            return []
+        kept: list[object] = []
+        dropped = 0
+        for item in v:
+            if isinstance(item, LLMFinding):
+                kept.append(item)
+                continue
+            try:
+                kept.append(LLMFinding.model_validate(item))
+            except ValidationError:
+                dropped += 1
+        if dropped:
+            logger.warning("Dropped %d malformed finding(s) from LLM analysis result", dropped)
+        return kept
 
 
 def estimate_tokens(text: str) -> int:
@@ -470,15 +571,41 @@ class LLMAnalyzerBase:
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
         self._uses_native_connection_retries = _uses_native_connection_retries(self._llm)
-        self._structured_llm = (
-            self._llm.with_structured_output(self.response_schema) if self.response_schema else None
-        )
+        self._structured_llm = self._build_structured_llm()
         self._usage_collector = new_inference_usage_collector(
             node=node,
             request_kind="structured_output" if self.response_schema else "chat_completion",
             model=model,
             chat_model=self._llm,
         )
+
+    def _build_structured_llm(self) -> object | None:
+        """Build the structured-output model per ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD``.
+
+        CLI providers keep their prompt-and-parse adapter (equivalent to
+        ``prompt_json``). HTTP providers honor the configured method when
+        ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`` is set (``function_calling``
+        | ``json_mode`` | ``json_schema`` | ``prompt_json``); unset keeps the
+        provider's native default. ``prompt_json`` is the dependency-free
+        schema-in-prompt + JSON extraction fallback.
+        """
+        if not self.response_schema:
+            return None
+        if isinstance(self._llm, AgentCLIChatModel):
+            return self._llm.with_structured_output(self.response_schema)
+        method = resolve_structured_output_method()
+        if method == "prompt_json":
+            return PromptJsonStructuredModel(self._llm, self.response_schema)
+        if method is None:
+            # Preserve the provider's native default (e.g. ChatOpenAI's
+            # json_schema structured outputs).
+            return self._llm.with_structured_output(self.response_schema)
+        structured = self._llm.with_structured_output(self.response_schema, method=method)
+        if method == "json_mode":
+            # LangChain's json_mode binds response_format but does not put the
+            # schema in the prompt; augment it so the model produces the shape.
+            return PromptAugmentedStructuredModel(structured, self.response_schema)
+        return structured
 
     @property
     def inference_usage(self) -> list[dict[str, object]]:
@@ -588,8 +715,13 @@ class LLMAnalyzerBase:
         if self._structured_llm:
             try:
                 response = _invoke_with_usage(self._structured_llm, prompt, self._usage_collector)
-            except (StructuredOutputParseError, ValidationError) as exc:
-                raise _StructuredResponseValidationError from exc
+            except (StructuredOutputParseError, ValidationError, OutputParserException) as exc:
+                raise _StructuredResponseValidationError(error_class=type(exc).__name__) from exc
+            if response is None:
+                # Provider returned no tool call / no parseable structured payload.
+                raise _StructuredResponseValidationError(
+                    "model returned no structured output", error_class="NoStructuredOutput"
+                )
         else:
             response = _raw_response_text(
                 _invoke_with_usage(self._llm, prompt, self._usage_collector)
@@ -654,8 +786,13 @@ class LLMAnalyzerBase:
                 response = await _ainvoke_with_usage(
                     self._structured_llm, prompt, self._usage_collector
                 )
-            except (StructuredOutputParseError, ValidationError) as exc:
-                raise _StructuredResponseValidationError from exc
+            except (StructuredOutputParseError, ValidationError, OutputParserException) as exc:
+                raise _StructuredResponseValidationError(error_class=type(exc).__name__) from exc
+            if response is None:
+                # Provider returned no tool call / no parseable structured payload.
+                raise _StructuredResponseValidationError(
+                    "model returned no structured output", error_class="NoStructuredOutput"
+                )
         else:
             response = _raw_response_text(
                 await _ainvoke_with_usage(self._llm, prompt, self._usage_collector)
@@ -734,7 +871,7 @@ class LLMAnalyzerBase:
                 prompt = self.build_prompt(batch, **kwargs)
                 result = self._invoke_batch_with_retries(batch, prompt)
                 outcome.successful.append(result)
-            except _StructuredResponseValidationError:
+            except _StructuredResponseValidationError as exc:
                 logger.warning(
                     "LLM structured response validation failed for %s after %d attempts",
                     batch.file_label,
@@ -743,7 +880,7 @@ class LLMAnalyzerBase:
                 outcome.failures.append(
                     BatchFailure(
                         batch=batch,
-                        error_class=ValidationError.__name__,
+                        error_class=getattr(exc, "error_class", ValidationError.__name__),
                         reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
                     )
                 )
@@ -836,7 +973,7 @@ class LLMAnalyzerBase:
                 outcome.failures.append(
                     BatchFailure(
                         batch=batch,
-                        error_class=ValidationError.__name__,
+                        error_class=getattr(result, "error_class", ValidationError.__name__),
                         reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
                     )
                 )

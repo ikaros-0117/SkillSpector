@@ -1,3 +1,10 @@
+### Unreleased
+### Features/Bug Fixes
+* feat(llm): configurable structured-output method + prompt_json fallback for weak-JSON endpoints (`SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`)
+* fix(llm): treat LangChain OutputParserException and no-tool-call responses as retryable, per-batch structured-output failures (previously failed the whole analyzer)
+* fix(llm): tolerate near-miss LLM JSON (severity case variants, null fields, stringified/nested findings) and retain valid findings when some are malformed
+
+---
 ### 2.9.5 (Friday, August 14, 2026)
 ### Features/Bug Fixes
 * Scope the locality guard to the namespace (#365)

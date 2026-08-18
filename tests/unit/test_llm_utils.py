@@ -23,7 +23,7 @@ in the active provider — see ``tests/unit/test_providers.py``.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_anthropic import ChatAnthropic
@@ -35,6 +35,8 @@ from skillspector import llm_utils
 from skillspector.inference_usage import InferenceUsageCollector
 from skillspector.llm_utils import (
     AgentCLIChatModel,
+    PromptAugmentedStructuredModel,
+    PromptJsonStructuredModel,
     StructuredOutputParseError,
     _ainvoke_with_usage,
     _extract_json_object,
@@ -635,3 +637,104 @@ class TestRunAsync:
         """Test run_async correctly handles async functions with await calls."""
         result = run_async(self._test_async_function(5, delay=0.01))
         assert result == 10
+
+
+class TestPromptJsonStructuredModel:
+    """Tests for the prompt-and-parse HTTP structured-output adapter."""
+
+    def _make_model(self, response_text: str) -> tuple[MagicMock, PromptJsonStructuredModel]:
+        from skillspector.llm_analyzer_base import LLMAnalysisResult
+
+        chat = MagicMock()
+        chat.invoke.return_value = AIMessage(content=response_text)
+        return chat, PromptJsonStructuredModel(chat, LLMAnalysisResult)
+
+    def test_augments_prompt_with_schema(self) -> None:
+        chat, model = self._make_model('{"findings": []}')
+        model.invoke("analyze this")
+        prompt = chat.invoke.call_args[0][0]
+        assert "analyze this" in prompt
+        assert "JSON Schema" in prompt
+        assert '"findings"' in prompt
+        assert "Do not wrap it in markdown code fences" in prompt
+
+    def test_extracts_markdown_fenced_json(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalysisResult
+
+        _, model = self._make_model('```json\n{"findings": []}\n```')
+        assert model.invoke("analyze") == LLMAnalysisResult(findings=[])
+
+    def test_extracts_json_with_surrounding_prose(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalysisResult
+
+        _, model = self._make_model(
+            'Sure! Here is the analysis:\n{"findings": []}\nHope that helps.'
+        )
+        assert model.invoke("analyze") == LLMAnalysisResult(findings=[])
+
+    def test_invalid_json_raises_structured_output_parse_error(self) -> None:
+        _, model = self._make_model("this is not json at all")
+        with pytest.raises(StructuredOutputParseError):
+            model.invoke("analyze")
+
+    def test_malformed_items_are_dropped_not_fatal(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalysisResult
+
+        _, model = self._make_model(
+            '{"findings": [{"severity": "BOGUS", "rule_id": "X"}, '
+            '{"rule_id": "OK", "message": "m", "severity": "HIGH", "start_line": 1}]}'
+        )
+        result = model.invoke("analyze")
+        assert isinstance(result, LLMAnalysisResult)
+        assert [f.rule_id for f in result.findings] == ["OK"]
+
+    def test_invoke_with_usage_marks_response_received(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalysisResult
+
+        chat, model = self._make_model('{"findings": []}')
+        collector = InferenceUsageCollector(
+            node="semantic_test",
+            request_kind="structured_output",
+            provider="openai",
+            requested_model="m",
+        )
+        result = model.invoke_with_usage("analyze", collector)
+        assert collector.response_received is True
+        assert result == LLMAnalysisResult(findings=[])
+
+    async def test_ainvoke(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalysisResult
+
+        _, model = self._make_model('{"findings": []}')
+        assert await model.ainvoke("analyze") == LLMAnalysisResult(findings=[])
+
+
+class TestPromptAugmentedStructuredModel:
+    """Tests for the schema-in-prompt wrapper around a structured-output runnable."""
+
+    def test_augments_prompt_and_delegates(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalysisResult
+
+        runnable = MagicMock()
+        runnable.invoke.return_value = LLMAnalysisResult(findings=[])
+        model = PromptAugmentedStructuredModel(runnable, LLMAnalysisResult)
+
+        result = model.invoke("analyze")
+
+        prompt = runnable.invoke.call_args[0][0]
+        assert "JSON Schema" in prompt
+        assert '"findings"' in prompt
+        assert result == LLMAnalysisResult(findings=[])
+
+    async def test_ainvoke_augments_and_delegates(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalysisResult
+
+        runnable = MagicMock()
+        runnable.ainvoke = AsyncMock(return_value=LLMAnalysisResult(findings=[]))
+        model = PromptAugmentedStructuredModel(runnable, LLMAnalysisResult)
+
+        result = await model.ainvoke("analyze")
+
+        prompt = runnable.ainvoke.call_args[0][0]
+        assert "JSON Schema" in prompt
+        assert result == LLMAnalysisResult(findings=[])

@@ -15,7 +15,13 @@ run-loop for LLM-powered analysis. It handles:
 - **Line-numbered prompts** — the LLM sees `L01:`, `L02:` prefixes and reports
   accurate `start_line` values
 - **Structured output** — responses are validated via LangChain's
-  `with_structured_output` and Pydantic schemas
+  `with_structured_output` and Pydantic schemas. The steering method is
+  configurable with `SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`
+  (`function_calling` | `json_mode` | `json_schema` | `prompt_json`);
+  `prompt_json` embeds the JSON Schema in the prompt and parses the raw
+  completion, which is the dependency-free fallback for endpoints whose
+  tool-calling / JSON support is weak (e.g. some OpenAI-compatible gateways).
+  Unset keeps the provider's native default.
 - **Finding conversion** — `LLMFinding` objects convert directly to the graph
   state's `Finding` dataclass
 - **Precision-over-recall default** — `BASE_ANALYSIS_PROMPT` appends output

@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from langchain_anthropic import ChatAnthropic
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 from pydantic import ValidationError
@@ -43,8 +44,14 @@ from skillspector.llm_analyzer_base import (
     ledger_events_for_batches,
     number_lines,
     resolve_max_concurrency,
+    resolve_structured_output_method,
 )
-from skillspector.llm_utils import AgentCLIChatModel, StructuredOutputParseError
+from skillspector.llm_utils import (
+    AgentCLIChatModel,
+    PromptAugmentedStructuredModel,
+    PromptJsonStructuredModel,
+    StructuredOutputParseError,
+)
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
@@ -78,6 +85,32 @@ class TestResolveMaxConcurrency:
     def test_below_one_clamps_to_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "0")
         assert resolve_max_concurrency() == 1
+
+
+class TestResolveStructuredOutputMethod:
+    def test_unset_uses_provider_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        assert resolve_structured_output_method() is None
+
+    def test_blank_uses_provider_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "  ")
+        assert resolve_structured_output_method() is None
+
+    @pytest.mark.parametrize(
+        "value",
+        ["function_calling", "json_mode", "json_schema", "prompt_json"],
+    )
+    def test_valid_values(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", value)
+        assert resolve_structured_output_method() == value
+
+    def test_uppercase_value_is_lowercased(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "PROMPT_JSON")
+        assert resolve_structured_output_method() == "prompt_json"
+
+    def test_invalid_falls_back_to_provider_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "bogus")
+        assert resolve_structured_output_method() is None
 
 
 class TestEstimateTokens:
@@ -201,9 +234,13 @@ MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
 
 
 def _structured_response_validation_error() -> ValidationError:
-    """Build the error raised when a provider returns malformed findings."""
+    """Build the error raised when a provider returns malformed findings.
+
+    The result schema now tolerates near-miss ``findings`` payloads, so a
+    top-level non-object is used to produce a genuine ``ValidationError``.
+    """
     with pytest.raises(ValidationError) as exc_info:
-        LLMAnalysisResult.model_validate({"findings": "not-an-array"})
+        LLMAnalysisResult.model_validate(["not", "an", "object"])
     return exc_info.value
 
 
@@ -352,6 +389,62 @@ class TestStructuredOutputConfiguration:
         response_format = payloads[0]["response_format"]["json_schema"]
         assert response_format["strict"] is True
         assert response_format["schema"]["additionalProperties"] is False
+
+    def test_unset_keeps_provider_default(self) -> None:
+        """Without the env var, the provider's native structured-output default wins."""
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = MagicMock()
+        with patch(MOCK_PATCH_TARGET, return_value=mock_llm):
+            LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+
+        mock_llm.with_structured_output.assert_called_once_with(LLMAnalysisResult)
+
+    def test_prompt_json_builds_prompt_json_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "prompt_json")
+        mock_llm = MagicMock()
+        with patch(MOCK_PATCH_TARGET, return_value=mock_llm):
+            analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+
+        assert isinstance(analyzer._structured_llm, PromptJsonStructuredModel)
+        mock_llm.with_structured_output.assert_not_called()
+
+    def test_json_mode_wraps_with_prompt_augmentation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_mode")
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = MagicMock()
+        with patch(MOCK_PATCH_TARGET, return_value=mock_llm):
+            analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+
+        assert isinstance(analyzer._structured_llm, PromptAugmentedStructuredModel)
+        mock_llm.with_structured_output.assert_called_once_with(
+            LLMAnalysisResult, method="json_mode"
+        )
+
+    def test_function_calling_passes_method(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "function_calling")
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = MagicMock()
+        with patch(MOCK_PATCH_TARGET, return_value=mock_llm):
+            analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+
+        mock_llm.with_structured_output.assert_called_once_with(
+            LLMAnalysisResult, method="function_calling"
+        )
+        assert not isinstance(
+            analyzer._structured_llm,
+            (PromptJsonStructuredModel, PromptAugmentedStructuredModel),
+        )
+
+    def test_cli_provider_keeps_cli_adapter(self) -> None:
+        """CLI providers keep their prompt-and-parse adapter regardless of the env var."""
+        provider = MagicMock()
+        cli = AgentCLIChatModel(provider, self.MODEL, 1024)
+        with patch(MOCK_PATCH_TARGET, return_value=cli):
+            analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+
+        assert type(analyzer._structured_llm).__name__ == "_StructuredAgentCLIModel"
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +879,123 @@ class TestRunBatches:
             analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
 
         analyzer._structured_llm.invoke.assert_not_called()
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_output_parser_exception_recovers_on_retry(self, sleep: MagicMock) -> None:
+        """LangChain OutputParserException is a structured-output failure, not a crash."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[
+                OutputParserException("malformed tool arguments"),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.invoke.call_count == 2
+        sleep.assert_called_once_with(0.5)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_output_parser_exception_isolated_after_retries(self, sleep: MagicMock) -> None:
+        """A model that never emits a parseable tool call loses only its own batch."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[
+                OutputParserException("bad"),
+                OutputParserException("bad"),
+                OutputParserException("bad"),
+                OutputParserException("bad"),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+        batches = [
+            Batch(file_path="malformed.py", content="bad response"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = analyzer.run_batches_detailed(batches)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
+            ("malformed.py", "OutputParserException")
+        ]
+        assert analyzer._structured_llm.invoke.call_count == 5
+        assert sleep.call_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_none_response_recovers_on_retry(self, sleep: MagicMock) -> None:
+        """A plain-text (no tool call) response is retried, not NotImplementedError."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[None, LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.invoke.call_count == 2
+        sleep.assert_called_once_with(0.5)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_none_response_isolated_after_retries(self, sleep: MagicMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[None, None, None, None, LLMAnalysisResult(findings=[])]
+        )
+        batches = [
+            Batch(file_path="malformed.py", content="bad response"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = analyzer.run_batches_detailed(batches)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
+            ("malformed.py", "NoStructuredOutput")
+        ]
+        assert analyzer._structured_llm.invoke.call_count == 5
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_prompt_json_mode_retries_and_isolates(
+        self, sleep: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """prompt_json failures flow through the same retry + isolation policy."""
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "prompt_json")
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        assert isinstance(analyzer._structured_llm, PromptJsonStructuredModel)
+        analyzer._structured_llm._chat_model.invoke = MagicMock(
+            side_effect=[
+                AIMessage(content="no json object here"),
+                AIMessage(content="no json object here"),
+                AIMessage(content="no json object here"),
+                AIMessage(content="no json object here"),
+                AIMessage(content='{"findings": []}'),
+            ]
+        )
+        batches = [
+            Batch(file_path="bad.py", content="bad"),
+            Batch(file_path="good.py", content="good"),
+        ]
+
+        outcome = analyzer.run_batches_detailed(batches)
+
+        assert [item[0].file_path for item in outcome.successful] == ["good.py"]
+        assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
+            ("bad.py", "StructuredOutputParseError")
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1232,6 +1442,55 @@ class TestARunBatches:
         with pytest.raises(ValueError, match="no API key"):
             await analyzer.arun_batches(batches)
 
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_output_parser_exception_isolated_after_retries(self, sleep: AsyncMock) -> None:
+        """Concurrent batches: the malformed one is isolated, the clean one survives."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+
+        def _side(prompt: str) -> object:
+            if "malformed.py" in prompt:
+                raise OutputParserException("bad")
+            return LLMAnalysisResult(findings=[])
+
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=_side)
+        batches = [
+            Batch(file_path="malformed.py", content="bad response"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = await analyzer.arun_batches_detailed(batches)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
+            ("malformed.py", "OutputParserException")
+        ]
+        assert sleep.await_count == 3
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_none_response_isolated_after_retries(self, sleep: AsyncMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+
+        def _side(prompt: str) -> object:
+            if "malformed.py" in prompt:
+                return None
+            return LLMAnalysisResult(findings=[])
+
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=_side)
+        batches = [
+            Batch(file_path="malformed.py", content="bad response"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = await analyzer.arun_batches_detailed(batches)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
+            ("malformed.py", "NoStructuredOutput")
+        ]
+        assert sleep.await_count == 3
+
 
 class TestLedgerEventsForBatches:
     def test_successful_overlap_is_excluded_from_failed_range(self) -> None:
@@ -1528,6 +1787,88 @@ class TestLLMAnalysisResult:
         assert d["explanation"] == ""
         assert d["end_line"] is None
 
+    def test_severity_case_insensitive(self) -> None:
+        for raw, expected in [
+            ("High", "HIGH"),
+            ("high", "HIGH"),
+            ("Critical", "CRITICAL"),
+            ("medium", "MEDIUM"),
+            ("LOW", "LOW"),
+        ]:
+            f = LLMFinding(rule_id="X", message="x", severity=raw, start_line=1)
+            assert f.severity == expected
+
+    def test_severity_still_rejects_unknown_values(self) -> None:
+        with pytest.raises(ValueError):
+            LLMFinding(rule_id="X", message="x", severity="UNKNOWN", start_line=1)
+
+    def test_null_message_becomes_empty_string(self) -> None:
+        f = LLMFinding(rule_id="X", message=None, severity="LOW", start_line=1)
+        assert f.message == ""
+
+    def test_null_start_line_materializes_at_line_one(self) -> None:
+        f = LLMFinding(rule_id="X", message="x", severity="LOW", start_line=None)
+        assert f.start_line == 1
+
+    def test_null_confidence_defaults(self) -> None:
+        f = LLMFinding(rule_id="X", message="x", severity="LOW", start_line=1, confidence=None)
+        assert f.confidence == 0.5
+
+    def test_findings_none_coerced_to_empty(self) -> None:
+        result = LLMAnalysisResult.model_validate({"findings": None})
+        assert result.findings == []
+
+    def test_findings_stringified_json(self) -> None:
+        result = LLMAnalysisResult.model_validate(
+            {"findings": ('[{"rule_id": "X", "message": "m", "severity": "LOW", "start_line": 1}]')}
+        )
+        assert len(result.findings) == 1
+        assert result.findings[0].rule_id == "X"
+
+    def test_findings_invalid_string_becomes_empty(self) -> None:
+        result = LLMAnalysisResult.model_validate({"findings": "not-json"})
+        assert result.findings == []
+
+    def test_findings_nested_object(self) -> None:
+        result = LLMAnalysisResult.model_validate(
+            {
+                "findings": {
+                    "findings": [
+                        {
+                            "rule_id": "X",
+                            "message": "m",
+                            "severity": "LOW",
+                            "start_line": 1,
+                        }
+                    ]
+                }
+            }
+        )
+        assert len(result.findings) == 1
+
+    def test_findings_partial_success_keeps_valid_items(self) -> None:
+        """One malformed finding no longer discards the whole file's analysis."""
+        result = LLMAnalysisResult.model_validate(
+            {
+                "findings": [
+                    {"rule_id": "X", "message": "m", "severity": "HIGH", "start_line": 3},
+                    {"message": "missing rule id", "severity": "HIGH", "start_line": 1},
+                ]
+            }
+        )
+        assert [f.rule_id for f in result.findings] == ["X"]
+
+    def test_findings_all_malformed_becomes_empty(self) -> None:
+        result = LLMAnalysisResult.model_validate(
+            {
+                "findings": [
+                    {"message": "no rule id"},
+                    {"rule_id": "X", "severity": "BOGUS"},
+                ]
+            }
+        )
+        assert result.findings == []
+
 
 class TestMetaAnalyzerResult:
     """Tests for the meta-analyzer-specific schemas."""
@@ -1646,6 +1987,62 @@ class TestMetaAnalyzerResult:
         assert d["confidence"] == 0.8
         assert d["explanation"] == ""
         assert d["start_line"] is None
+
+    def test_intent_impact_case_insensitive(self) -> None:
+        f = MetaAnalyzerFinding(
+            pattern_id="E1",
+            is_vulnerability=True,
+            confidence=0.9,
+            intent="Malicious",
+            impact="High",
+        )
+        assert f.intent == "malicious"
+        assert f.impact == "high"
+
+    def test_null_is_vulnerability_defaults_to_false(self) -> None:
+        f = MetaAnalyzerFinding(
+            pattern_id="E1",
+            is_vulnerability=None,
+            confidence=0.9,
+            intent="malicious",
+            impact="high",
+        )
+        assert f.is_vulnerability is False
+
+    def test_null_confidence_defaults(self) -> None:
+        f = MetaAnalyzerFinding(
+            pattern_id="E1",
+            is_vulnerability=True,
+            confidence=None,
+            intent="malicious",
+            impact="high",
+        )
+        assert f.confidence == 0.5
+
+    def test_findings_none_coerced_to_empty(self) -> None:
+        result = MetaAnalyzerResult.model_validate({"findings": None})
+        assert result.findings == []
+
+    def test_findings_partial_success_keeps_valid_items(self) -> None:
+        result = MetaAnalyzerResult.model_validate(
+            {
+                "findings": [
+                    {
+                        "pattern_id": "E1",
+                        "is_vulnerability": True,
+                        "confidence": 0.9,
+                        "intent": "malicious",
+                        "impact": "high",
+                    },
+                    {
+                        "pattern_id": "E1",
+                        "intent": "malicious",
+                        "impact": "high",
+                    },
+                ]
+            }
+        )
+        assert [f.pattern_id for f in result.findings] == ["E1"]
 
 
 class TestStructuredOutputSchema:

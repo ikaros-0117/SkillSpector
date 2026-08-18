@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
 from skillspector.inspection_ledger import (
@@ -86,10 +86,43 @@ class MetaAnalyzerFinding(BaseModel):
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
         # Accept 0-100 scale values from some models, then clamp into [0, 1].
+        if v is None:
+            return 0.5
         value = float(v)  # type: ignore[arg-type]
         if value > 2.0:
             value = value / 100.0
         return min(1.0, max(0.0, value))
+
+    @field_validator("is_vulnerability", mode="before")
+    @classmethod
+    def _coerce_vulnerability(cls, v: object) -> object:
+        # An explicit null should not invalidate the whole evaluation.
+        return False if v is None else v
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def _normalize_intent(cls, v: object) -> object:
+        # Accept case variants while keeping the allowed set strict.
+        if isinstance(v, str):
+            lower = v.strip().lower()
+            if lower in {"malicious", "negligent", "benign"}:
+                return lower
+        return v
+
+    @field_validator("impact", mode="before")
+    @classmethod
+    def _normalize_impact(cls, v: object) -> object:
+        # Accept case variants while keeping the allowed set strict.
+        if isinstance(v, str):
+            lower = v.strip().lower()
+            if lower in {"critical", "high", "medium", "low"}:
+                return lower
+        return v
+
+    @field_validator("explanation", "remediation", mode="before")
+    @classmethod
+    def _coerce_optional_text(cls, v: object) -> object:
+        return "" if v is None else v
 
     intent: Literal["malicious", "negligent", "benign"] = Field(
         description="Likely intent behind the finding"
@@ -117,14 +150,39 @@ class MetaAnalyzerResult(BaseModel):
     @field_validator("findings", mode="before")
     @classmethod
     def _parse_stringified_findings(cls, v: object) -> object:
-        """LLMs sometimes return the findings array as a JSON string."""
+        """Tolerate near-miss shapes and keep the valid evaluations.
+
+        Accepts ``None``, a stringified JSON array, or a nested
+        ``{"findings": [...]}`` object, and drops individually-malformed items
+        so one bad evaluation does not discard the whole file's meta-analysis.
+        """
+        if v is None:
+            return []
         if isinstance(v, str):
             try:
-                parsed = json.loads(v)
+                v = json.loads(v)
             except (json.JSONDecodeError, TypeError):
                 return []
-            return parsed if isinstance(parsed, list) else []
-        return v
+        if isinstance(v, dict):
+            inner = v.get("findings")
+            v = inner if isinstance(inner, list) else []
+        if not isinstance(v, list):
+            return []
+        kept: list[object] = []
+        dropped = 0
+        for item in v:
+            if isinstance(item, MetaAnalyzerFinding):
+                kept.append(item)
+                continue
+            try:
+                kept.append(MetaAnalyzerFinding.model_validate(item))
+            except ValidationError:
+                dropped += 1
+        if dropped:
+            logger.warning(
+                "Dropped %d malformed meta-analysis evaluation(s) from LLM response", dropped
+            )
+        return kept
 
     @field_validator("overall_assessment", mode="before")
     @classmethod

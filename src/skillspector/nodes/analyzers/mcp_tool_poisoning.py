@@ -771,6 +771,31 @@ class _TP4AnalysisResult(BaseModel):
     mismatched_capabilities: list[str] = Field(default_factory=list)
     explanation: str = ""
 
+    @field_validator("is_mismatch", mode="before")
+    @classmethod
+    def _coerce_mismatch(cls, v: object) -> object:
+        return False if v is None else v
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _coerce_confidence(cls, v: object) -> object:
+        return 0.0 if v is None else v
+
+    @field_validator(
+        "declared_purpose_summary",
+        "actual_behavior_summary",
+        "explanation",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_optional_text(cls, v: object) -> object:
+        return "" if v is None else v
+
+    @field_validator("mismatched_capabilities", mode="before")
+    @classmethod
+    def _coerce_capabilities(cls, v: object) -> object:
+        return [] if v is None else v
+
     @field_validator("confidence")
     @classmethod
     def _validate_confidence(cls, value: float) -> float:

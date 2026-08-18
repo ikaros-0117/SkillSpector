@@ -300,6 +300,12 @@ def scan(
                                OSS builds).
         SKILLSPECTOR_MODEL     Override the active provider's default
                                model (applies to every analyzer slot).
+        SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD
+                               Structured-output steering for LLM analyzers:
+                               function_calling | json_mode | json_schema |
+                               prompt_json. Unset uses the provider default;
+                               prompt_json is the dependency-free fallback for
+                               endpoints with weak tool-calling/JSON support.
         SKILLSPECTOR_LOG_LEVEL DEBUG | INFO | WARNING | ERROR (default WARNING).
 
     Provider credentials (one of):

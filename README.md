@@ -590,6 +590,7 @@ Issues (2)
 | `AWS_PROFILE` | Named AWS profile for the Bedrock provider — authenticates via SigV4 through boto3. When unset, the standard boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
 | `AWS_REGION` | AWS region for the Bedrock Runtime endpoint. Defaults to `us-west-2`. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
 | `SKILLSPECTOR_MODEL` | Override the active provider model. For hosted providers, this replaces the bundled default from the LLM Analysis table. For `claude_cli` and `codex_cli`, this is forwarded as `--model` instead of using the local CLI runtime fallback. | Optional |
+| `SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD` | Structured-output steering for LLM analyzers: `function_calling`, `json_mode`, `json_schema`, or `prompt_json`. Unset uses the provider's native default. `prompt_json` embeds the JSON Schema in the prompt and parses the raw completion — the dependency-free fallback for endpoints with weak tool-calling/JSON support (e.g. some OpenAI-compatible gateways). | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
 
