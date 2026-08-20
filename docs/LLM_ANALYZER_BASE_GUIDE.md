@@ -234,6 +234,35 @@ responsible for their own output instructions and are not affected.
 If a future analyzer specifically needs high-recall behavior (flag everything,
 filter later), it should override `build_prompt()` and omit the guidelines.
 
+### Reproducibility
+
+`LLMAnalyzerBase` ships two determinism controls that apply to every analyzer
+that subclasses it:
+
+- **Sampling:** provider chat models are constructed with `temperature=0`
+  (greedy decoding) by default; `SKILLSPECTOR_LLM_TEMPERATURE` overrides it and
+  `SKILLSPECTOR_LLM_SEED` pins a seed for OpenAI-compatible endpoints.
+- **Confidence quantization:** `normalize_llm_confidence()` normalizes and
+  quantizes LLM-reported confidence to two decimals in both
+  `LLMFinding` and `MetaAnalyzerFinding`, so small sampling jitter cannot flip
+  the aggregate risk score at an integer boundary.
+- **Self-consistency voting:** when `SKILLSPECTOR_LLM_VOTES=N` (N >= 2),
+  `_invoke_batch` / `_ainvoke_batch` sample each prompt N times and merge the
+  responses with `merge_voted_responses()`. Discovery findings survive only
+  when at least half the samples report them (confidence = median);
+  meta-analyzer `is_vulnerability` verdicts are majority-voted (ties
+  fail-closed to vulnerable). Raw-string analyzers (`response_schema=None`)
+  skip voting.
+- **Response cache:** when `SKILLSPECTOR_LLM_CACHE_DIR` is set, `_invoke_batch`
+  / `_ainvoke_batch` replay previously validated responses keyed by a digest of
+  provider + model + structured-output method + schema + sampling + votes +
+  prompt. Only successful (schema-validated) responses are stored, so the
+  existing bounded retry and fail-closed paths are unaffected.
+  `analyzer.cache_stats` exposes `(hits, misses)` for observability.
+
+See the README's *Reproducibility of LLM analysis* section for the full
+trade-off discussion.
+
 ---
 
 ## Customization Points

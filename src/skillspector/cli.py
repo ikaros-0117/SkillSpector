@@ -306,6 +306,25 @@ def scan(
                                prompt_json. Unset uses the provider default;
                                prompt_json is the dependency-free fallback for
                                endpoints with weak tool-calling/JSON support.
+        SKILLSPECTOR_LLM_TEMPERATURE
+                               Sampling temperature for LLM analyzers
+                               (default 0 = greedy decoding; empty = provider
+                               default). Lower values give more reproducible
+                               analyses.
+        SKILLSPECTOR_LLM_SEED  Optional fixed seed for OpenAI-compatible
+                               endpoints that support it (OpenAI, Azure,
+                               Ollama, vLLM, ...).
+        SKILLSPECTOR_LLM_VOTES Optional self-consistency voting: sample each
+                               analyzer prompt N times (>=2) and merge by
+                               majority vote. More stable findings/scores at
+                               N-times the LLM cost. Default 1 (voting off).
+        SKILLSPECTOR_LLM_CACHE_DIR
+                               Optional on-disk LLM response cache. Repeat
+                               scans of the same skill with the same model
+                               replay stored responses, making findings and
+                               the risk score reproducible.
+        SKILLSPECTOR_LLM_CACHE_MAX_AGE_DAYS
+                               Optional TTL for cached LLM responses (days).
         SKILLSPECTOR_LOG_LEVEL DEBUG | INFO | WARNING | ERROR (default WARNING).
 
     Provider credentials (one of):

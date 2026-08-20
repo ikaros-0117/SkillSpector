@@ -45,6 +45,7 @@ from skillspector.llm_analyzer_base import (
     BatchFailure,
     LLMAnalyzerBase,
     estimate_tokens,
+    normalize_llm_confidence,
 )
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
@@ -85,13 +86,9 @@ class MetaAnalyzerFinding(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
-        # Accept 0-100 scale values from some models, then clamp into [0, 1].
-        if v is None:
-            return 0.5
-        value = float(v)  # type: ignore[arg-type]
-        if value > 2.0:
-            value = value / 100.0
-        return min(1.0, max(0.0, value))
+        # Accept 0-100 scale values from some models, clamp into [0, 1], and
+        # quantize to two decimals for score stability (see normalize_llm_confidence).
+        return normalize_llm_confidence(v)
 
     @field_validator("is_vulnerability", mode="before")
     @classmethod

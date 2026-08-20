@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -42,7 +43,10 @@ from skillspector.llm_analyzer_base import (
     estimate_tokens,
     findings_in_range,
     ledger_events_for_batches,
+    merge_voted_responses,
+    normalize_llm_confidence,
     number_lines,
+    resolve_llm_votes,
     resolve_max_concurrency,
     resolve_structured_output_method,
 )
@@ -2892,3 +2896,473 @@ class TestTokenBudgetFunctions:
         out = get_max_output_tokens("unknown/model")
         assert inp == int(mocked_ctx * 0.75)
         assert out == int(mocked_ctx * 0.25)
+
+
+# ---------------------------------------------------------------------------
+# LLMResponseCache integration (opt-in on-disk replay)
+# ---------------------------------------------------------------------------
+
+
+class TestLLMResponseCacheIntegration:
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @staticmethod
+    def _llm_result() -> LLMAnalysisResult:
+        return LLMAnalysisResult(
+            findings=[
+                LLMFinding(
+                    rule_id="SEC-001",
+                    message="Hardcoded secret",
+                    severity="HIGH",
+                    start_line=5,
+                    confidence=0.9,
+                    explanation="Contains API key",
+                    remediation="Use env vars",
+                ),
+            ]
+        )
+
+    def _finding_signature(self, findings: list[Finding]) -> list[tuple[object, ...]]:
+        return [
+            (f.rule_id, f.message, f.severity, f.confidence, f.file, f.start_line) for f in findings
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_structured_cache_replays_without_second_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_CACHE_DIR", str(tmp_path))
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        result = self._llm_result()
+        analyzer._structured_llm.invoke = MagicMock(return_value=result)
+        batch = Batch(file_path="a.py", content="code")
+        prompt = analyzer.build_prompt(batch)
+
+        first = analyzer._invoke_batch(batch, prompt)
+        second = analyzer._invoke_batch(batch, prompt)
+
+        assert analyzer._structured_llm.invoke.call_count == 1
+        assert analyzer.cache_stats == (1, 1)
+        assert self._finding_signature(first[1]) == self._finding_signature(second[1])
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_async_structured_cache_replays_without_second_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_CACHE_DIR", str(tmp_path))
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        result = self._llm_result()
+        analyzer._structured_llm.ainvoke = AsyncMock(return_value=result)
+        batch = Batch(file_path="a.py", content="code")
+        prompt = analyzer.build_prompt(batch)
+
+        first = await analyzer._ainvoke_batch(batch, prompt)
+        second = await analyzer._ainvoke_batch(batch, prompt)
+
+        assert analyzer._structured_llm.ainvoke.call_count == 1
+        assert analyzer.cache_stats == (1, 1)
+        assert self._finding_signature(first[1]) == self._finding_signature(second[1])
+
+    @patch(MOCK_PATCH_TARGET)
+    def test_raw_mode_cache_replays_without_second_call(
+        self,
+        get_chat_model: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_CACHE_DIR", str(tmp_path))
+        mock_llm = MagicMock()
+        get_chat_model.return_value = mock_llm
+        analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
+        from langchain_core.messages import AIMessage
+
+        mock_llm.invoke.return_value = AIMessage(content='{"findings": []}')
+        batch = Batch(file_path="a.py", content="code")
+        prompt = analyzer.build_prompt(batch)
+
+        first = analyzer._invoke_batch(batch, prompt)
+        second = analyzer._invoke_batch(batch, prompt)
+
+        assert mock_llm.invoke.call_count == 1
+        assert analyzer.cache_stats == (1, 1)
+        assert first[1] == second[1]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_different_prompt_does_not_reuse_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_CACHE_DIR", str(tmp_path))
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(return_value=self._llm_result())
+        batch_a = Batch(file_path="a.py", content="code a")
+        batch_b = Batch(file_path="b.py", content="code b")
+
+        analyzer._invoke_batch(batch_a, analyzer.build_prompt(batch_a))
+        analyzer._invoke_batch(batch_b, analyzer.build_prompt(batch_b))
+
+        assert analyzer._structured_llm.invoke.call_count == 2
+        assert analyzer.cache_stats == (0, 2)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cache_disabled_by_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_LLM_CACHE_DIR", raising=False)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(return_value=self._llm_result())
+        batch = Batch(file_path="a.py", content="code")
+        prompt = analyzer.build_prompt(batch)
+
+        analyzer._invoke_batch(batch, prompt)
+        analyzer._invoke_batch(batch, prompt)
+
+        assert analyzer._structured_llm.invoke.call_count == 2
+        assert analyzer.cache_stats == (0, 2)
+        assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency voting + confidence quantization
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLLMVotes:
+    def test_unset_uses_single_sample(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_LLM_VOTES", raising=False)
+        assert resolve_llm_votes() == 1
+
+    def test_blank_uses_single_sample(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_VOTES", "   ")
+        assert resolve_llm_votes() == 1
+
+    def test_valid_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_VOTES", "3")
+        assert resolve_llm_votes() == 3
+
+    def test_invalid_falls_back_to_single_sample(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_VOTES", "abc")
+        assert resolve_llm_votes() == 1
+
+    def test_below_one_falls_back_to_single_sample(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_VOTES", "0")
+        assert resolve_llm_votes() == 1
+
+
+class TestNormalizeLLMConfidence:
+    def test_none_defaults(self) -> None:
+        assert normalize_llm_confidence(None) == 0.5
+        assert normalize_llm_confidence(None, default=0.7) == 0.7
+
+    def test_quantizes_to_two_decimals(self) -> None:
+        assert normalize_llm_confidence(0.876) == 0.88
+        assert normalize_llm_confidence(0.881) == 0.88
+        assert normalize_llm_confidence(0.885) == 0.89  # banker's rounding on .5
+
+    def test_clamps_and_scales(self) -> None:
+        assert normalize_llm_confidence(1.5) == 1.0
+        assert normalize_llm_confidence(-0.3) == 0.0
+        assert normalize_llm_confidence(85) == 0.85
+        assert normalize_llm_confidence(150) == 1.0
+
+    def test_non_numeric_raises(self) -> None:
+        with pytest.raises(ValueError):
+            normalize_llm_confidence("not-a-number")
+
+    def test_llm_finding_quantizes(self) -> None:
+        f = LLMFinding(rule_id="X", message="x", severity="LOW", start_line=1, confidence=0.876)
+        assert f.confidence == 0.88
+
+    def test_meta_finding_quantizes(self) -> None:
+        f = MetaAnalyzerFinding(
+            pattern_id="P1",
+            is_vulnerability=True,
+            confidence=0.876,
+            intent="benign",
+            impact="low",
+        )
+        assert f.confidence == 0.88
+
+
+class TestMergeVotedResponses:
+    def _discovery(
+        self, rule_id: str, line: int, confidence: float, message: str = "msg"
+    ) -> LLMAnalysisResult:
+        return LLMAnalysisResult(
+            findings=[
+                LLMFinding(
+                    rule_id=rule_id,
+                    message=message,
+                    severity="HIGH",
+                    start_line=line,
+                    confidence=confidence,
+                )
+            ]
+        )
+
+    def test_single_response_passthrough(self) -> None:
+        response = self._discovery("X", 1, 0.9)
+        merged = merge_voted_responses([response], LLMAnalysisResult)
+        assert merged == response
+
+    def test_discovery_keeps_majority_finding(self) -> None:
+        # 2 of 3 samples report the finding -> kept with median confidence.
+        samples = [
+            self._discovery("X", 1, 0.91),
+            self._discovery("X", 1, 0.93),
+            LLMAnalysisResult(findings=[]),
+        ]
+        merged = merge_voted_responses(samples, LLMAnalysisResult)
+        assert len(merged.findings) == 1
+        assert merged.findings[0].confidence == 0.92
+
+    def test_discovery_majority_kept_with_median_confidence(self) -> None:
+        samples = [
+            self._discovery("X", 1, 0.91),
+            self._discovery("X", 1, 0.95),
+            self._discovery("X", 1, 0.93),
+        ]
+        merged = merge_voted_responses(samples, LLMAnalysisResult)
+        assert len(merged.findings) == 1
+        assert merged.findings[0].confidence == 0.93
+
+    def test_discovery_ignores_end_line_inconsistency(self) -> None:
+        # Two samples report the same finding with different/missing end_line;
+        # they must still count as one vote group.
+        samples = [
+            LLMAnalysisResult(
+                findings=[
+                    LLMFinding(
+                        rule_id="X",
+                        message="m",
+                        severity="HIGH",
+                        start_line=3,
+                        end_line=7,
+                        confidence=0.9,
+                    )
+                ]
+            ),
+            LLMAnalysisResult(
+                findings=[
+                    LLMFinding(
+                        rule_id="X",
+                        message="m",
+                        severity="HIGH",
+                        start_line=3,
+                        confidence=0.95,
+                    )
+                ]
+            ),
+            LLMAnalysisResult(findings=[]),
+        ]
+        merged = merge_voted_responses(samples, LLMAnalysisResult)
+        assert len(merged.findings) == 1
+        assert merged.findings[0].confidence == 0.93
+
+    def test_discovery_second_round_threshold(self) -> None:
+        # With 5 samples, a finding reported by only 2 samples is dropped.
+        samples = [
+            self._discovery("X", 1, 0.9),
+            self._discovery("X", 1, 0.9),
+            LLMAnalysisResult(findings=[]),
+            LLMAnalysisResult(findings=[]),
+            LLMAnalysisResult(findings=[]),
+        ]
+        merged = merge_voted_responses(samples, LLMAnalysisResult)
+        assert merged.findings == []
+
+    def _meta(
+        self,
+        pattern_id: str,
+        line: int,
+        *,
+        is_vulnerability: bool,
+        confidence: float,
+        intent: str = "benign",
+        impact: str = "low",
+    ) -> MetaAnalyzerResult:
+        return MetaAnalyzerResult(
+            findings=[
+                MetaAnalyzerFinding(
+                    pattern_id=pattern_id,
+                    start_line=line,
+                    is_vulnerability=is_vulnerability,
+                    confidence=confidence,
+                    intent=intent,
+                    impact=impact,
+                )
+            ]
+        )
+
+    def test_meta_majority_verdict(self) -> None:
+        samples = [
+            self._meta("P1", 3, is_vulnerability=True, confidence=0.8),
+            self._meta("P1", 3, is_vulnerability=True, confidence=0.7),
+            self._meta("P1", 3, is_vulnerability=False, confidence=0.9),
+        ]
+        merged = merge_voted_responses(samples, MetaAnalyzerResult)
+        assert len(merged.findings) == 1
+        assert merged.findings[0].is_vulnerability is True
+        assert merged.findings[0].confidence == 0.8
+
+    def test_meta_tie_fails_closed_to_vulnerable(self) -> None:
+        samples = [
+            self._meta("P1", 3, is_vulnerability=True, confidence=0.8),
+            self._meta("P1", 3, is_vulnerability=False, confidence=0.9),
+        ]
+        merged = merge_voted_responses(samples, MetaAnalyzerResult)
+        assert merged.findings[0].is_vulnerability is True
+
+    def test_meta_majority_false_drops_finding(self) -> None:
+        samples = [
+            self._meta("P1", 3, is_vulnerability=False, confidence=0.8),
+            self._meta("P1", 3, is_vulnerability=False, confidence=0.9),
+            self._meta("P1", 3, is_vulnerability=True, confidence=0.9),
+        ]
+        merged = merge_voted_responses(samples, MetaAnalyzerResult)
+        assert len(merged.findings) == 1
+        assert merged.findings[0].is_vulnerability is False
+
+    def test_meta_majority_intent_and_impact(self) -> None:
+        samples = [
+            self._meta(
+                "P1", 3, is_vulnerability=True, confidence=0.8, intent="malicious", impact="high"
+            ),
+            self._meta(
+                "P1", 3, is_vulnerability=True, confidence=0.9, intent="malicious", impact="high"
+            ),
+            self._meta(
+                "P1", 3, is_vulnerability=True, confidence=0.7, intent="negligent", impact="medium"
+            ),
+        ]
+        merged = merge_voted_responses(samples, MetaAnalyzerResult)
+        assert merged.findings[0].intent == "malicious"
+        assert merged.findings[0].impact == "high"
+
+    def test_overall_assessment_majority(self) -> None:
+        samples = [
+            MetaAnalyzerResult(
+                findings=[], overall_assessment={"risk_level": "HIGH", "summary": "a"}
+            ),
+            MetaAnalyzerResult(
+                findings=[], overall_assessment={"risk_level": "HIGH", "summary": "b"}
+            ),
+            MetaAnalyzerResult(
+                findings=[], overall_assessment={"risk_level": "LOW", "summary": "c"}
+            ),
+        ]
+        merged = merge_voted_responses(samples, MetaAnalyzerResult)
+        assert merged.overall_assessment is not None
+        assert merged.overall_assessment.risk_level == "HIGH"
+
+
+class TestVotingIntegration:
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_votes_three_merges_and_caches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_VOTES", "3")
+        monkeypatch.setenv("SKILLSPECTOR_LLM_CACHE_DIR", str(tmp_path))
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[
+                LLMAnalysisResult(
+                    findings=[
+                        LLMFinding(
+                            rule_id="SEC-001",
+                            message="x",
+                            severity="HIGH",
+                            start_line=1,
+                            confidence=0.91,
+                        )
+                    ]
+                ),
+                LLMAnalysisResult(
+                    findings=[
+                        LLMFinding(
+                            rule_id="SEC-001",
+                            message="x",
+                            severity="HIGH",
+                            start_line=1,
+                            confidence=0.93,
+                        )
+                    ]
+                ),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+        batch = Batch(file_path="a.py", content="code")
+        prompt = analyzer.build_prompt(batch)
+
+        first = analyzer._invoke_batch(batch, prompt)
+        # Reported by 2/3 samples -> kept, confidence = median of the two reporters.
+        assert len(first[1]) == 1
+        assert first[1][0].confidence == 0.92
+        assert analyzer._structured_llm.invoke.call_count == 3
+
+        # Second call replays the merged result from cache without invoking again.
+        second = analyzer._invoke_batch(batch, prompt)
+        assert analyzer._structured_llm.invoke.call_count == 3
+        assert analyzer.cache_stats == (1, 1)
+        assert [f.confidence for f in second[1]] == [0.92]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_async_votes_three_merges(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_VOTES", "3")
+        monkeypatch.setenv("SKILLSPECTOR_LLM_CACHE_DIR", str(tmp_path))
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[
+                LLMAnalysisResult(
+                    findings=[
+                        LLMFinding(
+                            rule_id="SEC-001",
+                            message="x",
+                            severity="HIGH",
+                            start_line=1,
+                            confidence=0.91,
+                        )
+                    ]
+                ),
+                LLMAnalysisResult(
+                    findings=[
+                        LLMFinding(
+                            rule_id="SEC-001",
+                            message="x",
+                            severity="HIGH",
+                            start_line=1,
+                            confidence=0.93,
+                        )
+                    ]
+                ),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+        batch = Batch(file_path="a.py", content="code")
+        prompt = analyzer.build_prompt(batch)
+
+        result = await analyzer._ainvoke_batch(batch, prompt)
+        assert len(result[1]) == 1
+        assert result[1][0].confidence == 0.92
+        assert analyzer._structured_llm.ainvoke.call_count == 3
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_votes_ignored_for_raw_string_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_LLM_VOTES", "3")
+        mock_llm = MagicMock()
+        with patch(MOCK_PATCH_TARGET, return_value=mock_llm):
+            analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
+        from langchain_core.messages import AIMessage
+
+        mock_llm.invoke.return_value = AIMessage(content="raw text")
+        batch = Batch(file_path="a.py", content="code")
+        prompt = analyzer.build_prompt(batch)
+
+        result = analyzer._invoke_batch(batch, prompt)
+        assert result[1] == ["raw text"]
+        assert mock_llm.invoke.call_count == 1  # raw mode: voting skipped

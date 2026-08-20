@@ -300,6 +300,43 @@ skillspector scan ./my-skill/
 skillspector scan ./my-skill/ --no-llm
 ```
 
+#### Reproducibility of LLM analysis
+
+LLM outputs are inherently non-deterministic: without explicit sampling
+controls, the same skill can produce slightly different findings and a slightly
+different risk score on every run. SkillSpector reduces this variance at three
+levels:
+
+1. **Deterministic sampling (default).** Analyzer requests use
+   `temperature=0` (greedy decoding) unless
+   `SKILLSPECTOR_LLM_TEMPERATURE` says otherwise, and you can pin a fixed
+   `SKILLSPECTOR_LLM_SEED` for OpenAI-compatible endpoints that support it.
+   This removes most run-to-run variance at no extra cost.
+2. **Structured outputs.** All LLM analyzers validate responses against a
+   Pydantic schema (function calling / `json_schema` / prompt-embedded JSON),
+   which constrains the model to a stable output shape.
+3. **Confidence quantization.** LLM-reported confidences are normalized and
+   quantized to two decimals, so tiny sampling differences (e.g. `0.876` vs
+   `0.882`) cannot flip the aggregate risk score at an integer boundary.
+4. **Self-consistency voting (opt-in).** Set `SKILLSPECTOR_LLM_VOTES=N` (N >= 2)
+   to sample each analyzer prompt N times and merge the responses by majority
+   vote: a discovery finding survives only when at least half the samples
+   report it (confidence = median), and a meta-analyzer verdict is confirmed
+   only by a majority (ties fail-closed to "vulnerable"). This removes
+   borderline run-to-run flips at the cost of N-times the LLM calls.
+5. **Response cache (opt-in).** Set `SKILLSPECTOR_LLM_CACHE_DIR` and repeat
+   scans of an unchanged skill replay the stored, validated LLM responses
+   instead of calling the provider again. The derived findings and risk score
+   are then byte-for-byte reproducible, and re-scans cost no tokens.
+
+For fully deterministic scans that never call an LLM, use `--no-llm` (static
+analysis only). Note that no provider guarantees bit-identical output forever:
+provider-side model updates with the same model label can still shift results,
+so pin the model label (`SKILLSPECTOR_MODEL`) and keep the cache
+(`SKILLSPECTOR_LLM_CACHE_MAX_AGE_DAYS`) when you need long-term auditability.
+The JSON report's `metadata.inference_usage` records which model and provider
+actually produced each response.
+
 ### MCP Server
 
 Run SkillSpector as a [Model Context Protocol](https://modelcontextprotocol.io)
@@ -582,6 +619,11 @@ Issues (2)
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
 | `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged; unset or blank preserves provider-default behavior. | Optional |
+| `SKILLSPECTOR_LLM_TEMPERATURE` | Sampling temperature for LLM analyzers. Defaults to `0` (greedy decoding) for reproducible analyses; set another value in `[0,2]` for more varied output, or an empty string to leave the provider default untouched. Models that do not accept a temperature (e.g. some reasoning models) silently ignore it. | Optional |
+| `SKILLSPECTOR_LLM_SEED` | Optional fixed seed passed to OpenAI-compatible endpoints that support `seed` (OpenAI, Azure OpenAI, Ollama, vLLM, ...). Anthropic/Bedrock have no seed support and ignore it. Combining `temperature=0` with a fixed seed gives the strongest determinism those endpoints offer. | Optional |
+| `SKILLSPECTOR_LLM_VOTES` | Optional self-consistency voting: sample each analyzer prompt `N` times (`N >= 2`) and merge responses by majority vote (median confidence). Makes findings and the risk score more stable across runs at `N`-times the LLM cost. Default `1` (single sample, voting off). | Optional |
+| `SKILLSPECTOR_LLM_CACHE_DIR` | Optional on-disk LLM response cache directory. When set, repeat scans of the same skill with the same model/prompt replay stored results instead of calling the provider again, making findings and the risk score byte-for-byte reproducible (and free). Delete the directory to clear it; entries are keyed by a digest of provider + model + structured-output method + schema + sampling settings + prompt. | Optional |
+| `SKILLSPECTOR_LLM_CACHE_MAX_AGE_DAYS` | Optional TTL for cached LLM responses, in days. Unset keeps entries forever. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
 | `ANTHROPIC_BASE_URL` | Override the native Anthropic endpoint (default: `https://api.anthropic.com`). | Optional |
 | `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |

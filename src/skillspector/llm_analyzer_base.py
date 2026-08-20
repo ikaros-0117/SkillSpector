@@ -50,6 +50,7 @@ from skillspector.inspection_ledger import (
     ledger_event,
     outcome_for_llm_batch_failure,
 )
+from skillspector.llm_cache import LLMResponseCache
 from skillspector.llm_utils import (
     AgentCLIChatModel,
     PromptAugmentedStructuredModel,
@@ -58,12 +59,14 @@ from skillspector.llm_utils import (
     _AgentCLIMessage,
     _ainvoke_with_usage,
     _invoke_with_usage,
+    chat_model_provider_name,
     get_chat_model,
     new_inference_usage_collector,
 )
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
+from skillspector.providers.chat_models import sampling_signature
 
 logger = get_logger(__name__)
 
@@ -161,6 +164,50 @@ def resolve_structured_output_method() -> str | None:
     return raw
 
 
+def resolve_llm_votes() -> int:
+    """Resolve self-consistency vote count from ``SKILLSPECTOR_LLM_VOTES``.
+
+    Defaults to ``1`` (single sample — voting disabled). Set to ``N >= 2`` to
+    sample each analyzer prompt ``N`` times and merge the results by majority
+    vote (see :func:`merge_voted_responses`), which stabilizes findings and
+    the derived risk score at the cost of ``N``-times the LLM calls. Invalid
+    or blank values fall back to ``1``.
+    """
+    raw = os.environ.get("SKILLSPECTOR_LLM_VOTES", "").strip()
+    if not raw:
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid SKILLSPECTOR_LLM_VOTES=%r (not an int); using 1 (voting off)",
+            raw,
+        )
+        return 1
+    if value < 1:
+        logger.warning("SKILLSPECTOR_LLM_VOTES=%d < 1; using 1 (voting off)", value)
+        return 1
+    return value
+
+
+def normalize_llm_confidence(value: object, *, default: float = 0.5) -> float:
+    """Normalize an LLM-reported confidence to a stable ``[0, 1]`` float.
+
+    Accepts ``None`` (falls back to *default*), 0-100 scale values from some
+    models (divided by 100), clamps out-of-range values into ``[0, 1]``, and
+    quantizes to two decimal places. Quantization keeps tiny sampling
+    differences (e.g. ``0.876`` vs ``0.882``) from flipping the aggregate risk
+    score at an integer boundary. Non-numeric input raises, preserving the
+    existing fail-parse behaviour.
+    """
+    if value is None:
+        return default
+    number = float(cast(Any, value))
+    if number > 2.0:
+        number = number / 100.0
+    return round(min(1.0, max(0.0, number)), 2)
+
+
 # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
 CHARS_PER_TOKEN = 4
 CHUNK_OVERLAP_LINES = 50
@@ -230,13 +277,9 @@ class LLMFinding(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
-        # Accept 0-100 scale values from some models, then clamp into [0, 1].
-        if v is None:
-            return 0.5
-        value = float(cast(Any, v))
-        if value > 2.0:
-            value = value / 100.0
-        return min(1.0, max(0.0, value))
+        # Accept 0-100 scale values from some models, clamp into [0, 1], and
+        # quantize to two decimals for score stability (see normalize_llm_confidence).
+        return normalize_llm_confidence(v)
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`Finding` for the graph state."""
@@ -541,6 +584,177 @@ Reference line numbers (shown as L-prefixes) when reporting findings.
 
 
 # ---------------------------------------------------------------------------
+# Self-consistency voting (merge N samples into one stable response)
+# ---------------------------------------------------------------------------
+
+
+def _finding_identity(item: dict[str, Any]) -> tuple[str, int]:
+    """Stable identity for one finding across samples: (rule, start_line).
+
+    ``end_line`` is intentionally ignored: the meta-analyzer treats
+    ``start_line`` as the discriminator for multiple findings with the same
+    pattern in one file, and LLMs are inconsistent about whether they report
+    ``end_line`` at all. Including it would split one logical finding across
+    vote groups and wrongly drop it below the majority threshold.
+    """
+    rule_id = str(item.get("rule_id") or item.get("pattern_id") or "")
+    start = item.get("start_line")
+    try:
+        start_key = int(start) if start is not None else -1
+    except (TypeError, ValueError):
+        start_key = -1
+    return (rule_id, start_key)
+
+
+def _median(values: list[float]) -> float:
+    """Median of *values* (already quantized to two decimals)."""
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2 == 1:
+        return ordered[mid]
+    return round((ordered[mid - 1] + ordered[mid]) / 2.0, 2)
+
+
+def _majority_value(items: list[dict[str, Any]], field: str) -> object | None:
+    """First-seen value with the most non-``None`` occurrences (deterministic tie-break)."""
+    counts: dict[object, int] = {}
+    order: list[object] = []
+    for item in items:
+        value = item.get(field)
+        if value is None:
+            continue
+        if value not in counts:
+            counts[value] = 0
+            order.append(value)
+        counts[value] += 1
+    if not counts:
+        return None
+    return max(order, key=lambda value: counts[value])
+
+
+def _representative(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Item whose confidence is closest to the group median (ties keep first)."""
+    confidences = [
+        float(item["confidence"]) for item in items if item.get("confidence") is not None
+    ]
+    if not confidences:
+        return items[0]
+    target = _median(confidences)
+    return min(
+        items,
+        key=lambda item: (
+            abs(float(item["confidence"]) - target) if item.get("confidence") is not None else 1e9,
+        ),
+    )
+
+
+def _merge_discovery_findings(
+    groups: dict[tuple[str, int], list[dict[str, Any]]],
+    *,
+    keep_threshold: int,
+) -> list[dict[str, Any]]:
+    """Merge discovery-mode findings: keep findings reported by >= *keep_threshold* samples."""
+    merged: list[dict[str, Any]] = []
+    for items in groups.values():
+        if len(items) < keep_threshold:
+            continue
+        rep = _representative(items)
+        item = dict(rep)
+        confidences = [float(i["confidence"]) for i in items if i.get("confidence") is not None]
+        item["confidence"] = _median(confidences) if confidences else rep.get("confidence", 0.5)
+        merged.append(item)
+    return merged
+
+
+def _merge_meta_findings(
+    groups: dict[tuple[str, int], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Merge meta-analyzer findings via majority vote on ``is_vulnerability``.
+
+    ``is_vulnerability`` is ``True`` when at least half the samples that
+    evaluated the finding call it a vulnerability (a tie resolves to ``True`` —
+    fail-closed, because silently dropping a real vulnerability is worse than
+    keeping a borderline one). ``confidence`` is the median across samples;
+    ``intent`` / ``impact`` are majority values; explanation / remediation come
+    from the median-confidence representative.
+    """
+    merged: list[dict[str, Any]] = []
+    for items in groups.values():
+        verdicts = [
+            bool(i.get("is_vulnerability")) for i in items if i.get("is_vulnerability") is not None
+        ]
+        if not verdicts:
+            continue
+        is_vulnerability = sum(verdicts) * 2 >= len(verdicts)
+        rep = _representative(items)
+        item = dict(rep)
+        item["is_vulnerability"] = is_vulnerability
+        confidences = [float(i["confidence"]) for i in items if i.get("confidence") is not None]
+        item["confidence"] = _median(confidences) if confidences else rep.get("confidence", 0.5)
+        if (intent := _majority_value(items, "intent")) is not None:
+            item["intent"] = intent
+        if (impact := _majority_value(items, "impact")) is not None:
+            item["impact"] = impact
+        merged.append(item)
+    return merged
+
+
+def _merge_overall_assessment(assessments: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge ``overall_assessment``: majority ``risk_level``; summary from the representative."""
+    risk_levels = [a.get("risk_level") for a in assessments if a.get("risk_level") is not None]
+    if not risk_levels:
+        return assessments[0]
+    target = _majority_value(assessments, "risk_level")
+    rep = next((a for a in assessments if a.get("risk_level") == target), assessments[0])
+    return {
+        "risk_level": target,
+        "summary": rep.get("summary", ""),
+    }
+
+
+def merge_voted_responses(responses: list[BaseModel], schema: type[BaseModel]) -> BaseModel:
+    """Merge ``N >= 2`` structured responses into one via per-finding majority vote.
+
+    Discovery mode (:class:`LLMAnalysisResult`): a finding survives only when it
+    is reported by at least half the samples (rounded up), and its confidence is
+    the median of the reporting samples — findings that jitter in and out of
+    samples cannot move the aggregate risk score.
+
+    Meta-analyzer mode (:class:`MetaAnalyzerResult`): each static finding's
+    ``is_vulnerability`` verdict is majority-voted (ties fail-closed to
+    ``True``), confidence is the median, and intent/impact are majority values.
+
+    ``schema`` must be the response schema used to validate each sample; the
+    merged result is re-validated through it.
+    """
+    if len(responses) <= 1:
+        return responses[0]
+    groups: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    assessments: list[dict[str, Any]] = []
+    for response in responses:
+        data = response.model_dump(mode="json")
+        for item in data.get("findings") or []:
+            if isinstance(item, dict):
+                groups[_finding_identity(item)].append(item)
+        if data.get("overall_assessment") is not None:
+            assessments.append(data["overall_assessment"])
+
+    is_meta = any(item.get("pattern_id") is not None for items in groups.values() for item in items)
+    if is_meta:
+        merged_findings = _merge_meta_findings(groups)
+    else:
+        merged_findings = _merge_discovery_findings(
+            groups, keep_threshold=(len(responses) + 1) // 2
+        )
+
+    payload: dict[str, Any] = {"findings": merged_findings}
+    if assessments:
+        payload["overall_assessment"] = _merge_overall_assessment(assessments)
+    return schema.model_validate(payload)
+
+
+# ---------------------------------------------------------------------------
 # Base LLM Analyzer
 # ---------------------------------------------------------------------------
 
@@ -578,6 +792,17 @@ class LLMAnalyzerBase:
             model=model,
             chat_model=self._llm,
         )
+        self._votes = resolve_llm_votes()
+        self._response_cache = LLMResponseCache(
+            provider=chat_model_provider_name(self._llm) or "unknown",
+            model=model,
+            method=self._structured_output_method_label(),
+            schema=self.response_schema,
+            sampling=sampling_signature(),
+            votes=self._votes,
+        )
+        self._cache_hits = 0
+        self._cache_misses = 0
 
     def _build_structured_llm(self) -> object | None:
         """Build the structured-output model per ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD``.
@@ -607,10 +832,29 @@ class LLMAnalyzerBase:
             return PromptAugmentedStructuredModel(structured, self.response_schema)
         return structured
 
+    def _structured_output_method_label(self) -> str:
+        """Return a stable label for the active structured-output transport.
+
+        Included in the LLM response cache key so entries produced through
+        different transports (native tool calling, json_mode, prompt-embedded
+        JSON, CLI prompt-and-parse, raw string) never collide.
+        """
+        if not self.response_schema:
+            return "raw"
+        if isinstance(self._llm, AgentCLIChatModel):
+            return "prompt_json_cli"
+        method = resolve_structured_output_method()
+        return method or "native"
+
     @property
     def inference_usage(self) -> list[dict[str, object]]:
         """Provider-reported usage captured for this analyzer instance."""
         return list(self._usage_collector.snapshot())
+
+    @property
+    def cache_stats(self) -> tuple[int, int]:
+        """Return ``(hits, misses)`` for the opt-in response cache."""
+        return self._cache_hits, self._cache_misses
 
     @property
     def response_received(self) -> bool:
@@ -704,14 +948,13 @@ class LLMAnalyzerBase:
 
     # -- Run loop -----------------------------------------------------------
 
-    def _invoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
-        """Invoke and parse one batch synchronously."""
-        logger.debug(
-            "LLM call for %s (tokens~%d, findings=%d)",
-            batch.file_label,
-            estimate_tokens(prompt),
-            len(batch.findings),
-        )
+    def _invoke_batch_once(self, batch: Batch, prompt: str) -> BaseModel | str:
+        """Perform a single provider invocation and return the validated response.
+
+        Structured mode returns the Pydantic response model (or raises
+        :class:`_StructuredResponseValidationError` for malformed output);
+        raw-string mode returns the assistant text. No caching or voting here.
+        """
         if self._structured_llm:
             try:
                 response = _invoke_with_usage(self._structured_llm, prompt, self._usage_collector)
@@ -722,10 +965,37 @@ class LLMAnalyzerBase:
                 raise _StructuredResponseValidationError(
                     "model returned no structured output", error_class="NoStructuredOutput"
                 )
+            return cast(BaseModel, response)
+        return _raw_response_text(_invoke_with_usage(self._llm, prompt, self._usage_collector))
+
+    def _invoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
+        """Invoke and parse one batch synchronously, replaying cached responses.
+
+        When ``SKILLSPECTOR_LLM_VOTES`` is set to ``N >= 2`` (and the analyzer
+        uses structured output), the prompt is sampled ``N`` times and the
+        responses are merged by majority vote before parsing.
+        """
+        logger.debug(
+            "LLM call for %s (tokens~%d, findings=%d, votes=%d)",
+            batch.file_label,
+            estimate_tokens(prompt),
+            len(batch.findings),
+            self._votes,
+        )
+        cached = self._response_cache.load(prompt)
+        if cached is not None:
+            self._cache_hits += 1
+            logger.debug("LLM cache hit for %s", batch.file_label)
+            return batch, self.parse_response(cached, batch)
+
+        self._cache_misses += 1
+        response: BaseModel | str
+        if self._votes > 1 and self.response_schema is not None:
+            responses = [self._invoke_batch_once(batch, prompt) for _ in range(self._votes)]
+            response = merge_voted_responses(cast(list[BaseModel], responses), self.response_schema)
         else:
-            response = _raw_response_text(
-                _invoke_with_usage(self._llm, prompt, self._usage_collector)
-            )
+            response = self._invoke_batch_once(batch, prompt)
+        self._response_cache.store(prompt, response)
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
@@ -773,14 +1043,8 @@ class LLMAnalyzerBase:
 
         raise AssertionError("bounded retry loop must return or raise")
 
-    async def _ainvoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
-        """Invoke and parse one batch asynchronously."""
-        logger.debug(
-            "LLM call for %s (tokens~%d, findings=%d)",
-            batch.file_label,
-            estimate_tokens(prompt),
-            len(batch.findings),
-        )
+    async def _ainvoke_batch_once(self, batch: Batch, prompt: str) -> BaseModel | str:
+        """Async single provider invocation; see :meth:`_invoke_batch_once`."""
         if self._structured_llm:
             try:
                 response = await _ainvoke_with_usage(
@@ -793,10 +1057,39 @@ class LLMAnalyzerBase:
                 raise _StructuredResponseValidationError(
                     "model returned no structured output", error_class="NoStructuredOutput"
                 )
+            return cast(BaseModel, response)
+        return _raw_response_text(
+            await _ainvoke_with_usage(self._llm, prompt, self._usage_collector)
+        )
+
+    async def _ainvoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
+        """Invoke and parse one batch asynchronously, replaying cached responses.
+
+        When ``SKILLSPECTOR_LLM_VOTES`` is set to ``N >= 2`` (and the analyzer
+        uses structured output), the prompt is sampled ``N`` times and the
+        responses are merged by majority vote before parsing.
+        """
+        logger.debug(
+            "LLM call for %s (tokens~%d, findings=%d, votes=%d)",
+            batch.file_label,
+            estimate_tokens(prompt),
+            len(batch.findings),
+            self._votes,
+        )
+        cached = self._response_cache.load(prompt)
+        if cached is not None:
+            self._cache_hits += 1
+            logger.debug("LLM cache hit for %s", batch.file_label)
+            return batch, self.parse_response(cached, batch)
+
+        self._cache_misses += 1
+        response: BaseModel | str
+        if self._votes > 1 and self.response_schema is not None:
+            responses = [await self._ainvoke_batch_once(batch, prompt) for _ in range(self._votes)]
+            response = merge_voted_responses(cast(list[BaseModel], responses), self.response_schema)
         else:
-            response = _raw_response_text(
-                await _ainvoke_with_usage(self._llm, prompt, self._usage_collector)
-            )
+            response = await self._ainvoke_batch_once(batch, prompt)
+        self._response_cache.store(prompt, response)
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 

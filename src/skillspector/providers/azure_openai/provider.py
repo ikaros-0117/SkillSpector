@@ -37,6 +37,7 @@ from langchain_openai import AzureChatOpenAI
 from pydantic import SecretStr
 
 from skillspector.providers import registry
+from skillspector.providers.chat_models import resolve_sampling_params
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -71,6 +72,7 @@ class AzureOpenAIProvider:
         deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip() or model
         api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "").strip() or "2024-06-01"
 
+        temperature, seed = resolve_sampling_params()
         return AzureChatOpenAI(
             azure_endpoint=endpoint,
             azure_deployment=deployment,
@@ -78,6 +80,8 @@ class AzureOpenAIProvider:
             api_version=api_version,
             max_tokens=max_tokens,
             timeout=timeout,
+            temperature=temperature,
+            seed=seed,
         )
 
     def get_context_length(self, model: str) -> int | None:
