@@ -9,6 +9,6 @@
 #       max_output_tokens: <int>       # model's max output cap (optional)
 
 models:
-  "gpt-5.4":
+  "MiniMax-M3":
     context_length: 1000000
-    max_output_tokens: 128000
+    max_output_tokens: 512000
