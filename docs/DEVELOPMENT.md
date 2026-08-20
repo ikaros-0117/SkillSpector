@@ -299,6 +299,11 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai`. Also tier-2 fallback for non-OpenAI providers. | `sk-...` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
 | `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged; unset or blank preserves provider-default behavior. | `high` |
+| `SKILLSPECTOR_LLM_TEMPERATURE` | Sampling temperature for LLM analyzers (default `0` = greedy decoding for reproducible results; empty string keeps the provider default). | `0` |
+| `SKILLSPECTOR_LLM_SEED` | Optional fixed seed passed to OpenAI-compatible endpoints that support it (OpenAI, Azure, Ollama, vLLM, ...). | `42` |
+| `SKILLSPECTOR_LLM_VOTES` | Self-consistency voting: sample each analyzer prompt N times (N >= 2) and merge by majority vote. Default `1` (off). | `3` |
+| `SKILLSPECTOR_LLM_CACHE_DIR` | Optional on-disk LLM response cache; repeat scans of the same skill replay stored responses for byte-for-byte reproducible results. | `/tmp/llm-cache` |
+| `SKILLSPECTOR_LLM_CACHE_MAX_AGE_DAYS` | Optional TTL for cached LLM responses, in days. Unset keeps entries forever. | `30` |
 | `ANTHROPIC_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=anthropic`. | `sk-ant-...` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). For `claude_cli`, this is passed as `--model` to the `claude` binary. | `gpt-5.2` |
 

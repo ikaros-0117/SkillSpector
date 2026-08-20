@@ -1,5 +1,9 @@
 ### Unreleased
 ### Features/Bug Fixes
+* feat(llm): deterministic sampling defaults for reproducible analyses — `temperature=0` by default, optional fixed seed (`SKILLSPECTOR_LLM_TEMPERATURE` / `SKILLSPECTOR_LLM_SEED`)
+* feat(llm): opt-in on-disk LLM response cache — repeat scans of an unchanged skill replay stored, validated responses for byte-for-byte reproducible findings/score and zero token cost (`SKILLSPECTOR_LLM_CACHE_DIR` / `SKILLSPECTOR_LLM_CACHE_MAX_AGE_DAYS`)
+* feat(llm): quantize LLM-reported confidence to two decimals so sampling jitter cannot flip the aggregate risk score at integer boundaries
+* feat(llm): self-consistency voting — sample each analyzer prompt N times and merge by majority vote (median confidence; ties fail-closed to vulnerable) (`SKILLSPECTOR_LLM_VOTES`)
 * feat(llm): configurable structured-output method + prompt_json fallback for weak-JSON endpoints (`SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`)
 * fix(llm): treat LangChain OutputParserException and no-tool-call responses as retryable, per-batch structured-output failures (previously failed the whole analyzer)
 * fix(llm): tolerate near-miss LLM JSON (severity case variants, null fields, stringified/nested findings) and retain valid findings when some are malformed
