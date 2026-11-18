@@ -5,17 +5,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from typer.testing import CliRunner
 
-from skillspector import cli, mcp_server
+from skillspector import cli
 from skillspector.artifacts import SecurityTextView
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tool_misuse
@@ -47,8 +45,7 @@ def _partial_report(monkeypatch: pytest.MonkeyPatch, include_reference: bool) ->
     ]
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (False, ""))
     # Completed file work can coexist with unresolved interpretation. Zero
-    # partial-file counts isolate the MCP reason-specific reference exemption:
-    # an unknown reason must not inherit that exemption, even at 100% coverage.
+    # partial-file counts isolate reason-specific coverage policy even at 100% coverage.
     state = cast(
         SkillspectorState,
         {
@@ -101,26 +98,6 @@ def test_unknown_reason_preserves_strict_cli_rejection(
     assert payload["risk_assessment"]["recommendation"] == "CAUTION"
     assert payload["issues"] == []
     assert rendered["risk_score"] == 0
-
-
-@pytest.mark.parametrize("include_reference", [False, True], ids=["alone", "mixed-reference"])
-def test_unknown_reason_cannot_inherit_mcp_reference_exemption(
-    monkeypatch: pytest.MonkeyPatch, include_reference: bool
-) -> None:
-    rendered = _partial_report(monkeypatch, include_reference)
-    invocation = AsyncMock(return_value=rendered)
-    monkeypatch.setattr(mcp_server, "graph", SimpleNamespace(ainvoke=invocation))
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, ""))
-
-    verdict = asyncio.run(mcp_server.run_scan("fixture", use_llm=False, output_format="json"))
-
-    invocation.assert_awaited_once()
-    assert verdict["safe_to_install"] is False
-    assert verdict["execution_successful"] is True
-    assert verdict["risk_score"] == 0
-    assert verdict["recommendation"] == "CAUTION"
-    assert verdict["findings"] == []
-    assert verdict["analysis_completeness"] == rendered["analysis_completeness"]
 
 
 @pytest.mark.parametrize("include_reference", [False, True], ids=["alone", "mixed-reference"])

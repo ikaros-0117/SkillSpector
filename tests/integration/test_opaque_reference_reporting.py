@@ -3,13 +3,12 @@
 
 """Real static scans keep ordinary image limitations separate from AE1 findings.
 
-These tests use valid, benign PNGs and exercise graph, command-line, and MCP
+These tests use valid, benign PNGs and exercise graph and command-line
 entry points without provider calls or mocked scan results.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import pickle
@@ -24,8 +23,8 @@ import pytest
 from markdown_it import MarkdownIt
 
 from skillspector.graph import graph
-from skillspector.mcp_server import run_scan
 from skillspector.sarif_models import validate_sarif_report
+from tests.graph_scan import run_graph_scan
 
 pytestmark = pytest.mark.integration
 
@@ -540,54 +539,19 @@ def test_cli_reports_opaque_coverage_and_honors_exit_policy(
 
 
 @pytest.mark.parametrize(("output_format", "count"), [("json", 1), ("markdown", 4), ("sarif", 8)])
-async def test_mcp_core_does_not_claim_opaque_bundle_is_safe(
+async def test_async_graph_reports_incomplete_opaque_bundle(
     tmp_path: Path, output_format: str, count: int
 ) -> None:
     skill = _write_image_skill(tmp_path, count)
 
-    result = await run_scan(str(skill), use_llm=False, output_format=output_format)
+    result = await run_graph_scan(str(skill), use_llm=False, output_format=output_format)
 
-    assert result["findings"] == []
+    assert result["filtered_findings"] == []
     assert result["risk_score"] == 0
-    assert result["recommendation"] == "CAUTION"
-    assert result["safe_to_install"] is False
+    assert result["risk_recommendation"] == "CAUTION"
+
     assert result["execution_successful"] is True
     assert result["llm_requested"] is False
-    assert result["llm_used"] is False
-    assert result["scan_mode"] == "static-only"
+    assert any(call.get("ok") is True for call in result.get("llm_call_log", [])) is False
     _assert_completeness(result["analysis_completeness"], count)
-    _assert_report(result["report"], output_format, count)
-
-
-async def test_stdio_mcp_preserves_opaque_coverage_verdict(tmp_path: Path) -> None:
-    mcp = pytest.importorskip("mcp")
-    from mcp.client.stdio import StdioServerParameters, stdio_client
-
-    skill = _write_image_skill(tmp_path, 4, duplicate_label=True)
-    parameters = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "skillspector.cli", "mcp"],
-    )
-    # Keep transport diagnostics separate from both protocol output and scan input.
-    with (tmp_path / "mcp-stderr.log").open("w", encoding="utf-8") as stderr:
-        async with asyncio.timeout(60):
-            async with stdio_client(parameters, errlog=stderr) as (read, write):
-                async with mcp.ClientSession(read, write) as session:
-                    await session.initialize()
-                    tools = await session.list_tools()
-                    assert "scan_skill" in {tool.name for tool in tools.tools}
-                    response = await session.call_tool(
-                        "scan_skill",
-                        {"target": str(skill), "use_llm": False, "output_format": "json"},
-                    )
-
-    assert response.isError is False
-    result = response.structuredContent
-    assert isinstance(result, dict)
-    assert result["findings"] == []
-    assert result["risk_score"] == 0
-    assert result["recommendation"] == "CAUTION"
-    assert result["safe_to_install"] is False
-    assert result["scan_mode"] == "static-only"
-    _assert_completeness(result["analysis_completeness"], 4)
-    _assert_report(result["report"], "json", 4)
+    _assert_report(result["report_body"], output_format, count)

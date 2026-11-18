@@ -93,12 +93,12 @@ def test_table_body_boundaries_through_cli_and_mcp(
     use_llm: bool,
     successful_llm_transport: list[str],
 ) -> None:
-    exit_code, mcp, reports = _public_results(
+    exit_code, graph_result, reports = _public_results(
         tmp_path, _source(marker), use_llm, False, successful_llm_transport
     )
     assert exit_code == (0 if complete else 1)
-    assert mcp["safe_to_install"] is complete
-    assert mcp["llm_used"] is use_llm
+    assert graph_result["analysis_completeness"]["is_complete"] is complete
+    assert any(call.get("ok") is True for call in graph_result.get("llm_call_log", [])) is use_llm
     for report in reports:
         assert report["analysis_completeness"]["is_complete"] is complete
         if complete:
@@ -168,12 +168,12 @@ def test_table_header_boundaries_through_cli_and_mcp(
     use_llm: bool,
     successful_llm_transport: list[str],
 ) -> None:
-    exit_code, mcp, reports = _public_results(
+    exit_code, graph_result, reports = _public_results(
         tmp_path, _header_source(marker), use_llm, False, successful_llm_transport
     )
     assert exit_code == (0 if complete else 1)
-    assert mcp["safe_to_install"] is complete
-    assert mcp["llm_used"] is use_llm
+    assert graph_result["analysis_completeness"]["is_complete"] is complete
+    assert any(call.get("ok") is True for call in graph_result.get("llm_call_log", [])) is use_llm
     for report in reports:
         assert report["analysis_completeness"]["is_complete"] is complete
         if complete:

@@ -444,11 +444,8 @@ def test_multiline_matching_does_not_yield_its_budget_to_another_python_thread(
         sys.setswitchinterval(interval)
 
 
-@pytest.mark.asyncio
-async def test_parallel_scan_of_contractions_remains_complete(tmp_path: Path) -> None:
+def test_parallel_scan_of_contractions_remains_complete(tmp_path: Path) -> None:
     import json
-
-    from skillspector.mcp_server import run_scan
 
     text = (
         "# Reading notes\n\n"
@@ -465,8 +462,6 @@ async def test_parallel_scan_of_contractions_remains_complete(tmp_path: Path) ->
 
     result = _scan(tmp_path)
     assert result["analysis_completeness"]["is_complete"] is True
-    mcp = await run_scan(str(tmp_path), use_llm=False)
-    assert mcp["safe_to_install"] is True
 
 
 @pytest.mark.parametrize("irregular", [False, True])

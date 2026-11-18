@@ -1141,8 +1141,8 @@ class InputHandler:
     def _git_invocation(self, url: str) -> tuple[list[str], dict[str, str] | None, str]:
         """Build a Git policy for both ref discovery and cloning.
 
-        Remote MCP callers must not borrow the server's SSH keys, helpers,
-        authorization headers, URL rewrites, client certificates, or netrc.
+        Callers can isolate scans from ambient SSH keys, credential helpers,
+        authorization headers, URL rewrites, client certificates, and netrc.
         Trusted local callers retain the operator's configured Git identity.
         """
         if self._allow_git_credentials:

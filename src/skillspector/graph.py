@@ -17,7 +17,6 @@
 
 # Roadmap: analyzer auto-discovery and stage-as-category ordering (meta_analyzer last); respect
 # requires_api_key / is_available() so analyzers are skipped or warned when unavailable.
-# Roadmap: optional `skillspector serve` HTTP API (POST /scan, GET /results/{id}, GET /health).
 
 from __future__ import annotations
 

@@ -15,7 +15,7 @@ import pytest
 
 import skillspector.nodes.build_context as build_context_module
 from skillspector.input_handler import InputHandler
-from skillspector.mcp_server import run_scan
+from tests.graph_scan import run_graph_scan
 
 _SKILL = b"---\nname: primary-input-check\ndescription: Summarize supplied text.\n---\n# Notes\nSummarize the supplied text.\n"
 _PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(32))
@@ -59,14 +59,13 @@ async def test_unsupported_primary_is_incomplete_and_not_install_safe(
     target = tmp_path / name
     target.write_bytes(data)
 
-    result = await run_scan(str(tmp_path if directory else target), use_llm=False)
+    result = await run_graph_scan(str(tmp_path if directory else target), use_llm=False)
 
-    assert result["safe_to_install"] is False
     completeness = result["analysis_completeness"]
     assert completeness["is_complete"] is False
     assert completeness["total_components"] >= 1
     assert completeness["coverage_percent"] < 100.0
-    assert result["recommendation"] != "SAFE"
+    assert result["risk_recommendation"] != "SAFE"
     exceptions = completeness["ledger_exceptions"]
     primary = next(
         item
@@ -89,10 +88,9 @@ async def test_passive_asset_keeps_existing_reference_policy(
     (tmp_path / "SKILL.md").write_bytes(instructions)
     (tmp_path / "image.png").write_bytes(_PNG)
 
-    result = await run_scan(str(tmp_path), use_llm=False)
+    result = await run_graph_scan(str(tmp_path), use_llm=False)
 
     assert result["analysis_completeness"]["is_complete"] is not referenced
-    assert result["safe_to_install"] is not referenced
     assert not any(
         item["reason_code"] == "unsupported_primary_content"
         for item in result["analysis_completeness"]["ledger_exceptions"]
@@ -126,12 +124,12 @@ async def test_primary_failure_preserves_excluded_executable_evidence(
         (excluded / "worker.py").write_text("print('inert example')\n", encoding="utf-8")
         executable_path = "node_modules/example/worker.py"
 
-    result = await run_scan(str(tmp_path), use_llm=False)
+    result = await run_graph_scan(str(tmp_path), use_llm=False)
 
     completeness = result["analysis_completeness"]
     assert completeness["status"] == "failed"
     assert result["execution_successful"] is False
-    assert result["safe_to_install"] is False
+
     exceptions = completeness["ledger_exceptions"]
     assert any(
         item["path"] == "SKILL.md" and item["reason_code"] == "unsupported_primary_content"
@@ -162,10 +160,9 @@ async def test_supported_archives_remain_complete(
     else:
         target.write_bytes(_archive_bytes(members, compressed=archive_kind == "gzip"))
 
-    result = await run_scan(str(target), use_llm=False)
+    result = await run_graph_scan(str(target), use_llm=False)
 
     assert result["analysis_completeness"]["is_complete"] is True
-    assert result["safe_to_install"] is True
 
 
 @pytest.mark.parametrize("compressed", [False, True])
@@ -180,11 +177,10 @@ async def test_unsupported_tar_members_keep_incomplete_reference_evidence(
     (tmp_path / name).write_bytes(gzip.compress(data) if compressed else data)
     (tmp_path / "SKILL.md").write_bytes(_SKILL + f"\nRead [archive]({name}).\n".encode())
 
-    result = await run_scan(str(tmp_path), use_llm=False)
+    result = await run_graph_scan(str(tmp_path), use_llm=False)
 
-    assert result["safe_to_install"] is False
     assert result["analysis_completeness"]["is_complete"] is False
-    assert result["recommendation"] != "SAFE"
+    assert result["risk_recommendation"] != "SAFE"
     assert any(
         item["path"].startswith(name)
         and item["reason_code"] == "archive_unsupported_member"
@@ -193,7 +189,9 @@ async def test_unsupported_tar_members_keep_incomplete_reference_evidence(
         and item["outcome"] == "skipped"
         for item in result["analysis_completeness"]["ledger_exceptions"]
     )
-    assert any(issue["id"] == "AE1" and issue["severity"] == "HIGH" for issue in result["findings"])
+    assert any(
+        issue.rule_id == "AE1" and issue.severity == "HIGH" for issue in result["filtered_findings"]
+    )
 
 
 @pytest.mark.parametrize("extension", ["zip", "dat"])
@@ -208,9 +206,8 @@ async def test_zip_instruction_identity_survives_container_boundaries(
         if member.startswith("one/"):
             archive.writestr("two/README.md", "Summarize text.")
 
-    result = await run_scan(str(target), use_llm=False)
+    result = await run_graph_scan(str(target), use_llm=False)
 
-    assert result["safe_to_install"] is False
     assert result["execution_successful"] is False
     completeness = result["analysis_completeness"]
     assert completeness["status"] == "failed"
@@ -230,9 +227,8 @@ async def test_nested_directory_instructions_are_required(tmp_path: Path) -> Non
     target.parent.mkdir()
     target.write_bytes(_PNG)
 
-    result = await run_scan(str(tmp_path), use_llm=False)
+    result = await run_graph_scan(str(tmp_path), use_llm=False)
 
-    assert result["safe_to_install"] is False
     assert any(
         row["path"] == "pkg/SKILL.md" and row["reason_code"] == "unsupported_primary_content"
         for row in result["analysis_completeness"]["ledger_exceptions"]
@@ -248,9 +244,8 @@ async def test_utf8_codepoint_split_by_cache_limit_stays_partial(
     monkeypatch.setattr(build_context_module, limit_name, len(prefix) + 1)
     (tmp_path / "SKILL.md").write_bytes(prefix + "é\n".encode())
 
-    result = await run_scan(str(tmp_path), use_llm=False)
+    result = await run_graph_scan(str(tmp_path), use_llm=False)
 
-    assert result["safe_to_install"] is False
     assert result["execution_successful"] is True
     assert result["analysis_completeness"]["status"] == "partial"
     exceptions = result["analysis_completeness"]["ledger_exceptions"]
@@ -265,10 +260,10 @@ async def test_explicit_text_with_binary_extension_preserves_source_path(tmp_pat
     target = tmp_path / "instructions.png"
     target.write_bytes(_SKILL)
 
-    result = await run_scan(str(target), use_llm=False)
+    result = await run_graph_scan(str(target), use_llm=False)
 
     assert result["analysis_completeness"]["is_complete"] is True
-    payload = json.loads(result["report"])
+    payload = json.loads(result["report_body"])
     assert payload["analysis_completeness"]["fully_inspected_files"] == 1
 
 
@@ -284,9 +279,8 @@ async def test_archive_magic_words_remain_analyzable_text(tmp_path: Path, text: 
     target = tmp_path / "notes.md"
     target.write_bytes(text)
 
-    result = await run_scan(str(target), use_llm=False)
+    result = await run_graph_scan(str(target), use_llm=False)
 
-    assert result["safe_to_install"] is True
     assert result["analysis_completeness"]["is_complete"] is True
     assert result["analysis_completeness"]["fully_inspected_files"] == 1
     assert not result["analysis_completeness"]["ledger_exceptions"]
@@ -309,10 +303,9 @@ async def test_downloaded_file_keeps_primary_identity_but_zip_members_are_passiv
         lambda _self, _url: (headers, target, content),
     )
 
-    result = await run_scan(target, use_llm=False)
+    result = await run_graph_scan(target, use_llm=False)
 
     assert result["analysis_completeness"]["is_complete"] is archive
-    assert result["safe_to_install"] is archive
     if not archive:
         assert any(
             item["path"] == "notes.md" and item["reason_code"] == "unsupported_primary_content"
@@ -345,10 +338,10 @@ async def test_primary_failure_survives_ledger_overflow(
     for index in range(10):
         (excluded / f"{index}.py").write_text("pass\n", encoding="utf-8")
 
-    result = await run_scan(str(tmp_path), use_llm=False)
+    result = await run_graph_scan(str(tmp_path), use_llm=False)
 
     assert result["execution_successful"] is False
-    assert result["safe_to_install"] is False
+
     completeness = result["analysis_completeness"]
     assert completeness["status"] == "failed"
     assert any(
@@ -372,11 +365,10 @@ async def test_supported_zip_instruction_member_remains_complete(
     with zipfile.ZipFile(target, "w") as archive:
         archive.writestr("pkg/SKILL.md", inner.getvalue())
 
-    result = await run_scan(str(target), use_llm=False)
+    result = await run_graph_scan(str(target), use_llm=False)
 
     assert result["execution_successful"] is True
     assert result["analysis_completeness"]["is_complete"] is True
-    assert result["safe_to_install"] is True
 
 
 @pytest.mark.parametrize("extension", ["docx", "xlsx", "pptx"])
@@ -386,7 +378,7 @@ async def test_archive_extension_does_not_hide_unsupported_primary_bytes(
     target = tmp_path / f"notes.{extension}"
     target.write_bytes(_SKILL.decode().encode("utf-16"))
 
-    result = await run_scan(str(target), use_llm=False)
+    result = await run_graph_scan(str(target), use_llm=False)
 
     assert result["execution_successful"] is False
     assert result["analysis_completeness"]["status"] == "failed"
@@ -416,9 +408,8 @@ async def test_recognized_nested_zip_keeps_archive_failure_accounting(
     with zipfile.ZipFile(target, "w") as archive:
         archive.writestr("pkg/SKILL.md", content)
 
-    result = await run_scan(str(target), use_llm=False)
+    result = await run_graph_scan(str(target), use_llm=False)
 
-    assert result["safe_to_install"] is False
     assert result["analysis_completeness"]["is_complete"] is False
     reasons = {row["reason_code"] for row in result["analysis_completeness"]["ledger_exceptions"]}
     assert expected_reason in reasons

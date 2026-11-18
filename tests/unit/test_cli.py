@@ -226,13 +226,6 @@ def test_transitive_child_exact_baseline_round_trip(monkeypatch) -> None:
     assert not changed["suppressed_findings"]
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.com"])
-def test_mcp_cli_rejects_exposed_http_binding(host: str) -> None:
-    result = runner.invoke(app, ["mcp", "--transport", "http", "--host", host])
-    assert result.exit_code == 2
-    assert "must bind to a loopback IP" in result.output
-
-
 def test_discovered_files_tree_renders_untrusted_names_literally() -> None:
     """File names cannot inject Rich markup or terminal control sequences."""
     malicious_name = "\x1b]52;c;SGVsbG8=\x1b\\[conceal]hidden.py"
@@ -7769,10 +7762,6 @@ def _baseline_crashes_verbose(d: Path) -> FatalPath:
     return args, _scan_raises(RuntimeError("baseline crashed"))
 
 
-def _mcp_module_missing(d: Path) -> FatalPath:
-    return ["mcp"], patch.dict(sys.modules, {"skillspector.mcp_server": None})
-
-
 @pytest.mark.parametrize(
     ("build", "needle"),
     [
@@ -7801,7 +7790,6 @@ def _mcp_module_missing(d: Path) -> FatalPath:
         pytest.param(_baseline_input_missing, "baseline input missing", id="baseline-missing"),
         pytest.param(_baseline_crashes, "baseline crashed", id="baseline-crashes"),
         pytest.param(_baseline_crashes_verbose, "RuntimeError", id="baseline-verbose"),
-        pytest.param(_mcp_module_missing, "skillspector.mcp_server", id="mcp-module-missing"),
     ],
 )
 def test_fatal_diagnostics_never_reach_stdout(
@@ -8491,8 +8479,8 @@ def test_cli_baseline_rejects_failed_scan_before_writing(
         ("nope[/x]", "Error: nope[/x]"),
         ("[bold]x[/bold]", "Error: [bold]x[/bold]"),
         (
-            "Install it with: pip install 'skillspector[mcp]'",
-            "Error: Install it with: pip install 'skillspector[mcp]'",
+            "Install it with: pip install 'skillspector[dev]'",
+            "Error: Install it with: pip install 'skillspector[dev]'",
         ),
         ("emoji :smile: here", "Error: emoji :smile: here"),
         ("C:\\Users\\", "Error: C:\\Users\\"),
@@ -8516,21 +8504,6 @@ def test_scan_input_error_shows_bracketed_path_literally(bad_input: str) -> None
     assert result.exit_code == 2
     assert bad_input in result.output
     assert "MarkupError" not in result.output
-
-
-def test_mcp_missing_extra_install_hint_keeps_extra_name(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_run(**_kwargs: object) -> None:
-        raise ModuleNotFoundError(
-            "The MCP server requires the optional 'mcp' dependency. "
-            "Install it with: pip install 'skillspector[mcp]'"
-        )
-
-    monkeypatch.setattr("skillspector.mcp_server.run", fake_run)
-    result = runner.invoke(app, ["mcp"])
-    assert result.exit_code != 0
-    assert "skillspector[mcp]" in result.output
 
 
 def test_warning_line_renders_message_literally() -> None:

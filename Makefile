@@ -1,12 +1,7 @@
-.PHONY: help install install-dev langgraph-dev test test-unit test-provider openai anthropic nv_build gemini test-integration test-cov test-ci lint lint-fix format format-check clean build docker-build docker-smoke
+.PHONY: help install install-dev test test-unit test-provider openai anthropic nv_build gemini test-integration test-cov test-ci lint lint-fix format format-check clean build
 
 # Prefer uv if available, else use pip (set when Makefile is parsed)
 UV := $(shell command -v uv 2>/dev/null)
-
-# LangGraph Studio URL for `make langgraph-dev`.  Defaults to the hosted
-# LangSmith UI.  Override per invocation with:
-#   make langgraph-dev LANGGRAPH_STUDIO_URL=https://your-studio.example
-LANGGRAPH_STUDIO_URL = https://smith.langchain.com
 
 PROVIDER_TEST_SELECTION := $(filter openai anthropic nv_build gemini,$(MAKECMDGOALS))
 ifneq ($(PROVIDER_TEST_SELECTION),)
@@ -34,7 +29,6 @@ help:
 	@echo "Available targets (venv must be created and activated first):"
 	@echo "  make install        - Install the package (uses uv if available, else pip)"
 	@echo "  make install-dev    - Install with dev dependencies (uses uv if available, else pip)"
-	@echo "  make langgraph-dev  - Run LangGraph dev server (Studio at \$$LANGGRAPH_STUDIO_URL)"
 	@echo "  make test           - Run unit + integration tests"
 	@echo "  make test-unit      - Run unit tests only (no LLM calls)"
 	@echo "  make test-provider [openai|anthropic|nv_build|gemini] - Run live provider tests"
@@ -46,18 +40,12 @@ help:
 	@echo "  make format-check   - Check code formatting with ruff"
 	@echo "  make clean          - Remove build artifacts and cache files"
 	@echo "  make build          - Build the package"
-	@echo "  make docker-build   - Build the Docker image"
-	@echo "  make docker-smoke   - Build and smoke test the Docker image"
 
 install:
 	@if [ -n "$(UV)" ]; then uv sync; else pip install -e .; fi
 
 install-dev:
 	@if [ -n "$(UV)" ]; then uv sync --all-extras; else pip install -e ".[dev]"; fi
-
-# Run LangGraph dev server, opening Studio at LANGGRAPH_STUDIO_URL.
-langgraph-dev:
-	langgraph dev --studio-url $(LANGGRAPH_STUDIO_URL)
 
 # Run unit + integration tests
 test: test-unit test-integration
@@ -148,11 +136,3 @@ clean:
 # Build the package
 build: clean
 	python -m build
-
-# Build the Docker image
-docker-build:
-	docker build -t skillspector .
-
-# Build and smoke test the Docker image
-docker-smoke: docker-build
-	tests/docker/smoke.sh

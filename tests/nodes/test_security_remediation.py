@@ -34,7 +34,6 @@ from skillspector.artifacts import (
 from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.graph import graph
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, LedgerRecordType
-from skillspector.mcp_server import run_scan
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.nodes.analyzers import static_patterns_prompt_injection, static_runner
 from skillspector.nodes.analyzers.artifact_integrity import node as artifact_integrity
@@ -47,6 +46,7 @@ from skillspector.references import (
     resolve_bundle_references,
     resolve_bundle_references_with_metadata,
 )
+from tests.graph_scan import run_graph_scan
 
 
 def test_content_classification_uses_bytes_not_extension() -> None:
@@ -362,12 +362,11 @@ async def test_default_ignorable_boundary_preserves_p1_and_fails_closed_across_p
     )
     assert variant_result["risk_recommendation"] == "CAUTION"
 
-    verdict = await run_scan(str(variant_root), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(variant_root), use_llm=False, output_format="json")
 
-    assert {"P1", "AE6"} <= {finding["id"] for finding in verdict["findings"]}
+    assert {"P1", "AE6"} <= {finding.rule_id for finding in verdict["filtered_findings"]}
     assert verdict["analysis_completeness"] == completeness
-    assert verdict["recommendation"] == "CAUTION"
-    assert verdict["safe_to_install"] is False
+    assert verdict["risk_recommendation"] == "CAUTION"
 
 
 @pytest.mark.asyncio
@@ -387,12 +386,11 @@ async def test_unrelated_default_ignorable_boundary_does_not_trigger_obfuscation
     assert completeness["status"] == "complete"
     assert result["risk_recommendation"] == "SAFE"
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
 
-    assert not any(finding["id"] == "AE6" for finding in verdict["findings"])
+    assert not any(finding.rule_id == "AE6" for finding in verdict["filtered_findings"])
     assert verdict["analysis_completeness"] == completeness
-    assert verdict["recommendation"] == "SAFE"
-    assert verdict["safe_to_install"] is True
+    assert verdict["risk_recommendation"] == "SAFE"
 
 
 @pytest.mark.parametrize(
@@ -1978,8 +1976,8 @@ def test_reference_caveat_does_not_turn_self_reference_into_ae1(
 
 
 @pytest.mark.asyncio
-async def test_unresolved_reference_caveat_does_not_block_mcp_install(tmp_path: Path) -> None:
-    """A reference caveat hides no bytes, so it must not fail safe_to_install.
+async def test_missing_reference_keeps_graph_complete_with_caveats(tmp_path: Path) -> None:
+    """A missing reference hides no bundled bytes.
 
     Every discovered file was fully inspected and nothing was hidden from
     analysis; the report retains the caveat while treating coverage as complete.
@@ -1989,23 +1987,16 @@ async def test_unresolved_reference_caveat_does_not_block_mcp_install(tmp_path: 
         encoding="utf-8",
     )
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
 
     assert verdict["analysis_completeness"]["is_complete"] is True
     assert verdict["analysis_completeness"]["status"] == "complete_with_caveats"
-    assert verdict["recommendation"] == "SAFE"
-    assert verdict["safe_to_install"] is True
+    assert verdict["risk_recommendation"] == "SAFE"
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_reference_caveat_still_blocks_mcp_install(tmp_path: Path) -> None:
-    """An ambiguous reference is unlike a missing one: it must keep blocking.
-
-    The reference matches more than one bundled artifact, so the scanner has
-    not established which bytes the instruction actually reaches. Unlike the
-    missing-reference caveat above, this must not be exempted from
-    safe_to_install.
-    """
+async def test_ambiguous_reference_keeps_graph_incomplete(tmp_path: Path) -> None:
+    """An ambiguous reference leaves the underlying bundled artifact unknown."""
     (tmp_path / "SKILL.md").write_text(
         "# Skill\n\nContinue with [the local guide](guide.md).\n",
         encoding="utf-8",
@@ -2015,19 +2006,18 @@ async def test_ambiguous_reference_caveat_still_blocks_mcp_install(tmp_path: Pat
     (tmp_path / "extra").mkdir()
     (tmp_path / "extra" / "guide.md").write_text("extra guide", encoding="utf-8")
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
 
     assert verdict["analysis_completeness"]["is_complete"] is False
     assert any(
         row["reason_code"] == "reference_unresolved"
         for row in verdict["analysis_completeness"]["ledger_exceptions"]
     )
-    assert verdict["safe_to_install"] is False
 
 
 @pytest.mark.asyncio
-async def test_opaque_referenced_artifact_still_blocks_mcp_install(tmp_path: Path) -> None:
-    """Unlike a reference caveat, a resolved-but-opaque target hides bytes and must block."""
+async def test_opaque_referenced_artifact_keeps_graph_incomplete(tmp_path: Path) -> None:
+    """A resolved but opaque artifact leaves required bytes uninspected."""
     (tmp_path / "SKILL.md").write_text(
         """---
 name: binary-repro
@@ -2047,10 +2037,9 @@ Describe the diagram in assets/diagram.png to the user.
     assets.mkdir()
     (assets / "diagram.png").write_bytes(png)
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
 
     assert verdict["analysis_completeness"]["is_complete"] is False
-    assert verdict["safe_to_install"] is False
 
 
 def test_normalized_view_findings_remain_primary() -> None:
@@ -3329,10 +3318,10 @@ async def test_ambiguous_concealed_instruction_runs_fail_closed_in_graph_and_pub
     )
     assert result["risk_recommendation"] == "CAUTION"
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
 
-    assert any(finding["id"] == "AE6" for finding in verdict["findings"])
-    assert not any(finding["id"] == "P1" for finding in verdict["findings"])
+    assert any(finding.rule_id == "AE6" for finding in verdict["filtered_findings"])
+    assert not any(finding.rule_id == "P1" for finding in verdict["filtered_findings"])
     verdict_completeness = verdict["analysis_completeness"]
     assert verdict_completeness["is_complete"] is False
     assert verdict_completeness["status"] == "partial"
@@ -3340,8 +3329,7 @@ async def test_ambiguous_concealed_instruction_runs_fail_closed_in_graph_and_pub
         row["reason_code"] == LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
         for row in verdict_completeness["ledger_exceptions"]
     )
-    assert verdict["recommendation"] == "CAUTION"
-    assert verdict["safe_to_install"] is False
+    assert verdict["risk_recommendation"] == "CAUTION"
 
 
 @pytest.mark.asyncio
@@ -3434,13 +3422,12 @@ async def test_reported_obfuscated_instruction_bypasses_fail_closed_with_p1_and_
     )
     assert result["risk_recommendation"] != "SAFE"
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
 
-    verdict_ids = {finding["id"] for finding in verdict["findings"]}
+    verdict_ids = {finding.rule_id for finding in verdict["filtered_findings"]}
     assert {"P1", "AE6"} <= verdict_ids
     assert verdict["analysis_completeness"]["is_complete"] is False
-    assert verdict["recommendation"] != "SAFE"
-    assert verdict["safe_to_install"] is False
+    assert verdict["risk_recommendation"] != "SAFE"
 
 
 @pytest.mark.asyncio
@@ -3456,12 +3443,11 @@ async def test_logical_line_boundary_obfuscation_fails_closed_without_llm(
     assert result["analysis_completeness"]["is_complete"] is False
     assert result["risk_recommendation"] != "SAFE"
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
 
-    assert {"P1", "AE6"} <= {finding["id"] for finding in verdict["findings"]}
+    assert {"P1", "AE6"} <= {finding.rule_id for finding in verdict["filtered_findings"]}
     assert verdict["analysis_completeness"]["is_complete"] is False
-    assert verdict["recommendation"] != "SAFE"
-    assert verdict["safe_to_install"] is False
+    assert verdict["risk_recommendation"] != "SAFE"
 
 
 def test_artifact_integrity_ignores_benign_short_single_letter_notation() -> None:

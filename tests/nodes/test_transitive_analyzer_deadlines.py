@@ -15,7 +15,6 @@ from typer.testing import CliRunner
 from skillspector.cli import app
 from skillspector.graph import graph
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.mcp_server import run_scan
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.nodes.analyzers import (
     behavioral_ast,
@@ -30,6 +29,7 @@ from skillspector.nodes.build_context import build_context
 from skillspector.nodes.meta_analyzer import meta_analyzer
 from skillspector.python_ast import PythonSourceClassification
 from skillspector.state import WorkflowResourceBudget
+from tests.graph_scan import run_graph_scan
 
 
 class _RemainingTime:
@@ -104,27 +104,25 @@ def test_cli_fail_on_incomplete_exits_for_workflow_deadline(
     assert sc9["evidence"]["excluded_inspection_incomplete"] is True
 
 
-async def test_mcp_blocks_install_for_workflow_deadline(
+async def test_async_graph_reports_incomplete_when_workflow_deadline_expires(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    (tmp_path / "SKILL.md").write_text("# bounded MCP\n", encoding="utf-8")
+    (tmp_path / "SKILL.md").write_text("# bounded scan\n", encoding="utf-8")
     monkeypatch.setattr(
         "skillspector.nodes.build_context.ensure_workflow_resource_budget",
         lambda _state: _expired_workflow_budget(),
     )
 
-    verdict = await run_scan(
+    verdict = await run_graph_scan(
         str(tmp_path),
         use_llm=False,
         output_format="json",
-        allow_local_targets=True,
     )
 
-    assert verdict["safe_to_install"] is False
-    assert verdict["recommendation"] == "DO_NOT_INSTALL"
-    sc9 = next(finding for finding in verdict["findings"] if finding["id"] == "SC9")
-    assert sc9["location"]["file"] == "SKILL.md"
-    assert sc9["evidence"]["excluded_inspection_incomplete"] is True
+    assert verdict["risk_recommendation"] == "DO_NOT_INSTALL"
+    sc9 = next(finding for finding in verdict["filtered_findings"] if finding.rule_id == "SC9")
+    assert sc9.file == "SKILL.md"
+    assert sc9.evidence["excluded_inspection_incomplete"] is True
     assert verdict["analysis_completeness"]["status"] == "partial"
     assert verdict["analysis_completeness"]["is_complete"] is False
 

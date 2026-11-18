@@ -14,9 +14,9 @@ from typer.testing import CliRunner
 from skillspector.cli import app
 from skillspector.graph import graph
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.mcp_server import run_scan
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
+from tests.graph_scan import run_graph_scan
 
 _EMBEDDED_SHELL_COMMANDS = [
     "bash -c '$CMD -rf /'",
@@ -93,10 +93,9 @@ async def test_powershell_embedded_runtime_shell_fails_closed_publicly(
         _assert_shell_parse_limit(report["analysis_completeness"])
         assert report["risk_assessment"]["recommendation"] == "CAUTION"
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
     _assert_shell_parse_limit(verdict["analysis_completeness"])
-    assert verdict["recommendation"] == "CAUTION"
-    assert verdict["safe_to_install"] is False
+    assert verdict["risk_recommendation"] == "CAUTION"
 
 
 @pytest.mark.parametrize("content", _BENIGN_REPLACE_VALUES)
@@ -145,7 +144,6 @@ async def test_powershell_replace_values_remain_complete_publicly(tmp_path: Path
     assert report["analysis_completeness"]["status"] == "complete"
     assert report["risk_assessment"]["recommendation"] == "SAFE"
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
     assert verdict["analysis_completeness"]["status"] == "complete"
-    assert verdict["recommendation"] == "SAFE"
-    assert verdict["safe_to_install"] is True
+    assert verdict["risk_recommendation"] == "SAFE"

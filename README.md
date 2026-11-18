@@ -19,8 +19,6 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
 - **[Security policy](SECURITY.md)** — Report suspected vulnerabilities privately to NVIDIA PSIRT.
 - **[Analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md)** — Fail-closed bundle, parser, nested-artifact, ledger, and finding ceilings.
-- **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
-- **[OpenCode extension](docs/OPENCODE_EXTENSION.md)** — Install SkillSpector as an OpenCode tool and `/skillspector` command for scanning skills from inside agent sessions.
 
 ## Features
 
@@ -38,96 +36,23 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 
 > **Open-source software notice:** This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.
 
-Create and activate a virtual environment first (all `make` targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv` if available, otherwise `pip`.
-
-**Quick install with uv (CLI-only):**
+From this checkout, install the command with uv:
 
 ```bash
-uv tool install git+https://github.com/NVIDIA/skillspector.git
-# Update later: uv tool update skillspector
+uv tool install .
 ```
 
-If you plan to run `skillspector mcp`, install the MCP extra at install time:
+For the [Python API](#python-api-integration), install into the virtual
+environment your application uses. The Makefile uses uv when available and
+falls back to pip.
 
 ```bash
-uv tool install 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
-```
-
-**From source:**
-
-```bash
-# Clone the repository
-git clone https://github.com/NVIDIA/skillspector.git
-cd skillspector
-
-# Create and activate virtual environment
 uv venv .venv && source .venv/bin/activate
-# or: python3 -m venv .venv && source .venv/bin/activate
-
-# Install for production use
+# Or use python3 -m venv .venv && source .venv/bin/activate.
 make install
 ```
 
-To contribute, follow the [Development setup](#setup) for a supported Python
-interpreter and development dependencies.
-
-### Docker (no Python required)
-
-Run SkillSpector without installing Python by building it locally from the included [Dockerfile](Dockerfile). The image is based on the Docker Official Python `3.12-slim-bookworm` image.
-
-**Build the image:**
-
-```bash
-make docker-build
-# or: docker build -t skillspector .
-```
-
-**Scan a local directory** by mounting your current directory into `/scan`, the container's working directory:
-
-```bash
-docker run --rm -v "$PWD:/scan" skillspector scan ./my-skill/ --no-llm
-```
-
-**Scan with LLM analysis** by passing credentials with a local `.env` file:
-
-```bash
-cat > .env <<'EOF'
-SKILLSPECTOR_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-EOF
-```
-
-```bash
-docker run --rm \
-  -v "$PWD:/scan" \
-  --env-file .env \
-  skillspector scan ./my-skill/
-```
-
-Or pass credentials directly from your shell environment:
-
-```bash
-docker run --rm \
-  -v "$PWD:/scan" \
-  -e SKILLSPECTOR_PROVIDER=anthropic \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-  skillspector scan ./my-skill/
-```
-
-**Write a report to the host filesystem** by writing to the mounted directory:
-
-```bash
-docker run --rm --user "$(id -u):$(id -g)" \
-  -v "$PWD:/scan" \
-  skillspector scan ./my-skill/ --no-llm --format json --output report.json
-```
-
-**Optional alias** for repeated static scans:
-
-```bash
-alias skillspector-docker='docker run --rm -v "$PWD:/scan" skillspector'
-skillspector-docker scan ./my-skill/ --no-llm
-```
+See [Development setup](#setup) for supported Python versions and test dependencies.
 
 ### Basic Usage
 
@@ -186,33 +111,6 @@ When the count limit is reached, the CLI names the limit and suggests adjusting 
 or scanning sub-skills separately. Omitted skills remain visible in the aggregate
 report and coverage stays incomplete. Use `--fail-on-incomplete` in CI to fail on
 incomplete coverage; the default exit policy is unchanged.
-
-### Batch Scanning
-
-Scan entire directories of skills in parallel from `contrib/batch_scan/`:
-
-```bash
-python -m contrib.batch_scan.batch_scan ./my-skills/ --no-llm
-python -m contrib.batch_scan.batch_scan ./my-skills/ --workers 20 -f json -o report.json
-python -m contrib.batch_scan.batch_scan ./tests/fixtures/ -f terminal --workers 20
-```
-
-Supports multilingual detection (zh/ja/ko) and terminal/JSON/Markdown output.
-
-For LLM scans with higher concurrency, configure multiple API keys following
-[`.env.example`](contrib/batch_scan/.env.example) — the pool improves throughput
-and resilience, provided the keys don't share an account-level rate limit.
-
-See the [contrib guide](contrib/batch_scan/docs/) for details.
-
-> **Note on LLM support:** The default configuration targets DeepSeek as the
-> cheapest public option. DeepSeek-Chat is
-> [expected to sunset](https://api-docs.deepseek.com/), and the contributor
-> does not have hardware to test against local models. The batch scanner was
-> originally tested with OpenAI-compatible endpoints — DeepSeek's lack of
-> structured-output support required manual JSON-parsing patches. If you can
-> contribute a more universal backend (Ollama, vLLM, or a different provider),
-> PRs are very welcome.
 
 ### Comparing MCP Registry snapshots
 
@@ -496,72 +394,6 @@ skillspector scan ./my-skill/
 # Skip LLM analysis (faster, static analysis only)
 skillspector scan ./my-skill/ --no-llm
 ```
-
-### MCP Server
-
-Run SkillSpector as a [Model Context Protocol](https://modelcontextprotocol.io)
-server so local MCP-capable agents (Claude Code, Codex CLI, Gemini CLI)
-can call scanning as a tool and **gate skill/MCP installs on the
-result** — turning SkillSpector into a runtime guardrail instead of an
-out-of-band audit step.
-
-`skillspector mcp` requires `skillspector[mcp]`.
-
-```bash
-# Install, or reinstall if you already used the CLI-only path
-uv tool install --force 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
-
-# FastMCP stdio transport for local CLI agents
-skillspector mcp
-
-# Streamable HTTP transport on a local loopback interface
-skillspector mcp --transport http --host 127.0.0.1 --port 8000
-```
-
-The stdio transport is the current FastMCP path for local CLI agents, and the
-initialize hang reported in issue #199 still applies there.
-
-The server exposes a single tool:
-
-- **`scan_skill(target, use_llm=true, output_format="json", include_report=true)`** — scans a Git
-  URL, file URL, `.zip`, `.md` file, or directory and returns a structured
-  verdict: `risk_score` (0-100), `severity`, `recommendation`,
-  `safe_to_install`, and `findings`. It also reports `llm_used` / `scan_mode`
-  so a low score from a static-only scan is never mistaken for a clean full
-  scan.
-
-Set `include_report=false` when you only need the structured verdict. This
-omits the rendered `report` string and retains every other response field,
-including all findings and their occurrences, analysis completeness, and LLM
-accounting. The default still includes the full report. Report-only details,
-such as components, skill metadata, and suppressed findings, are unavailable
-in the compact response. Scanning and report generation still run normally;
-`output_format` must remain one of `json`, `markdown`, `sarif`, or `terminal`.
-
-Register it with Claude Code via:
-
-```bash
-claude mcp add skillspector -- skillspector mcp
-```
-
-> **Security — HTTP transport trust model**
->
-> The HTTP transport ships **without authentication**. Any caller that can
-> reach the port can invoke `scan_skill`. HTTP bindings are restricted to
-> loopback IPs (`127.0.0.1` or `::1`); `localhost` binds to `127.0.0.1` without
-> DNS resolution. Wildcard, routable and other hostname bindings are rejected.
->
-> - For remote access, put an authenticating reverse proxy (e.g. nginx + mTLS)
->   in front of the loopback listener.
-> - Local paths and `file://` URLs are **automatically rejected** over HTTP to
->   prevent unauthenticated callers from reading arbitrary host files. Only
->   remote Git and `.zip` URLs are accepted.
->
-> HTTP scans accept only credential-free `https://` targets. Git scans never use
-> the server's Git login or Git config. If a proxy or custom CA is needed, set
-> `HTTPS_PROXY`, `NO_PROXY` or `GIT_SSL_CAINFO` in the server environment.
-> Use stdio or the CLI for private repositories. Git redirects are rejected;
-> use the current repository URL after a rename or transfer.
 
 ## Vulnerability Patterns
 
@@ -875,9 +707,9 @@ must be writable; symlinked
 parents and non-regular destinations such as devices are refused. On macOS,
 ancestor directories must also be readable. File output requires POSIX no-follow
 directory operations and is unavailable on Windows. Unsupported file output fails
-before analysis. Omit `--output` for scan/batch stdout, or use
+before analysis. Omit `--output` to send scan reports to stdout, or use
 `skillspector baseline <path> -o -` for JSON on stdout, then redirect only to a
-trusted destination. Run Docker with your user ID as above so you can read its files.
+trusted destination.
 
 ## Integrating SkillSpector
 
@@ -998,15 +830,14 @@ tag's metadata. The commands below use Bash or Zsh.
 With **uv** installed:
 
 ```bash
-git clone https://github.com/NVIDIA/skillspector.git
-cd skillspector
+# From the SkillSpector checkout
 uv venv --python 3.12 .venv
 source .venv/bin/activate
 make install-dev
 ```
 
-If uv is not installed, clone the repository and enter it as above, then use
-an installed supported Python interpreter with `venv` and pip:
+If uv is unavailable, run these commands in the checkout with a supported
+Python interpreter:
 
 ```bash
 python3.12 -m venv .venv
@@ -1155,6 +986,7 @@ Based on research from "Agent Skills in the Wild: An Empirical Study of Security
 
 ```python
 from skillspector import graph
+from skillspector.cleanup import cleanup_result
 
 # Invoke the LangGraph workflow
 result = graph.invoke({
@@ -1163,13 +995,15 @@ result = graph.invoke({
     "use_llm": True,           # False for static-only analysis
 })
 
-# Access results
-print(f"Risk Score: {result['risk_score']}/100")
-print(f"Severity: {result['risk_severity']}")
-print(f"Recommendation: {result['risk_recommendation']}")
+try:
+    print(f"Risk Score: {result['risk_score']}/100")
+    print(f"Severity: {result['risk_severity']}")
+    print(f"Recommendation: {result['risk_recommendation']}")
 
-for finding in result["filtered_findings"]:
-    print(f"[{finding['severity']}] {finding['rule_id']}: {finding['message']}")
+    for finding in result["filtered_findings"]:
+        print(f"[{finding.severity}] {finding.rule_id}: {finding.message}")
+finally:
+    cleanup_result(result)
 ```
 
 ## License

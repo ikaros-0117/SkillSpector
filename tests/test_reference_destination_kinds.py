@@ -14,8 +14,8 @@ import pytest
 from typer.testing import CliRunner
 
 from skillspector.cli import app
-from skillspector.mcp_server import run_scan
 from skillspector.references import resolve_bundle_references_with_metadata
+from tests.graph_scan import run_graph_scan
 from tests.nodes.analyzers.test_documentation_reconstruction import (
     successful_llm_transport as successful_llm_transport,
 )
@@ -138,7 +138,7 @@ def _png_payload() -> bytes:
     )
 
 
-@pytest.mark.parametrize("channel", ["cli", "mcp"])
+@pytest.mark.parametrize("channel", ["cli", "graph"])
 @pytest.mark.parametrize(
     ("marker", "present", "use_llm"),
     [
@@ -184,10 +184,10 @@ async def test_encoded_destination_reporting_preserves_opaque_coverage(
         assert result.exit_code == (1 if present else 0), result.output
         report = json.loads(result.stdout)
     else:
-        verdict = await run_scan(str(tmp_path), use_llm=use_llm, output_format="json")
-        assert verdict["safe_to_install"] is (not present)
-        assert verdict["llm_used"] is use_llm
-        report = json.loads(verdict["report"])
+        verdict = await run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json")
+
+        assert any(call.get("ok") is True for call in verdict.get("llm_call_log", [])) is use_llm
+        report = json.loads(verdict["report_body"])
 
     assert report["execution_successful"] is True
     completeness = report["analysis_completeness"]

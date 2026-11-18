@@ -18,9 +18,9 @@ from typer.testing import CliRunner
 
 from skillspector.cli import app
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.mcp_server import run_scan
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
+from tests.graph_scan import run_graph_scan
 from tests.nodes.analyzers.test_documentation_reconstruction import _assert_llm_mode
 from tests.nodes.analyzers.test_documentation_reconstruction import (
     successful_llm_transport as successful_llm_transport,
@@ -398,15 +398,15 @@ def _public_results(
     cli = CliRunner().invoke(app, args)
     cli_calls = list(calls)
     calls.clear()
-    mcp = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
-    mcp_calls = list(calls)
+    graph_result = asyncio.run(run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+    graph_calls = list(calls)
     # Both interfaces have run before any decoding or report assertions.
     assert cli.exit_code in {0, 1}, cli.output
     assert cli.exception is None or (
         isinstance(cli.exception, SystemExit) and cli.exception.code == cli.exit_code
     )
-    reports = (json.loads(cli.output), json.loads(mcp["report"]))
-    for report, recorded_calls in zip(reports, (cli_calls, mcp_calls), strict=True):
+    reports = (json.loads(cli.output), json.loads(graph_result["report_body"]))
+    for report, recorded_calls in zip(reports, (cli_calls, graph_calls), strict=True):
         _assert_llm_mode(report, use_llm, recorded_calls)
         assert report["execution_successful"] is True
         assert report["analysis_completeness"]["execution_successful"] is True
@@ -426,7 +426,7 @@ def _public_results(
         if not use_llm:
             assert report["metadata"].get("llm_calls_attempted", 0) == 0
             assert report["metadata"].get("llm_calls_succeeded", 0) == 0
-    return cli.exit_code, mcp, reports
+    return cli.exit_code, graph_result, reports
 
 
 def _assert_public_partial(report: dict, referenced: bool) -> None:
@@ -460,7 +460,7 @@ def _assert_public_partial(report: dict, referenced: bool) -> None:
 )
 @pytest.mark.parametrize("use_llm", [False, True], ids=["no-llm", "llm"])
 @pytest.mark.parametrize("referenced", [False, True], ids=["entrypoint", "referenced"])
-def test_table_boundaries_reach_strict_cli_and_mcp_in_both_semantic_modes(
+def test_table_boundaries_reach_strict_cli_and_graph_in_both_semantic_modes(
     tmp_path: Path,
     content: str,
     complete: bool,
@@ -468,12 +468,12 @@ def test_table_boundaries_reach_strict_cli_and_mcp_in_both_semantic_modes(
     referenced: bool,
     successful_llm_transport: list[str],
 ) -> None:
-    exit_code, mcp, reports = _public_results(
+    exit_code, graph_result, reports = _public_results(
         tmp_path, content, use_llm, referenced, successful_llm_transport
     )
     assert exit_code == (0 if complete else 1)
-    assert mcp["safe_to_install"] is complete
-    assert mcp["llm_used"] is use_llm
+    assert graph_result["analysis_completeness"]["is_complete"] is complete
+    assert any(call.get("ok") is True for call in graph_result.get("llm_call_log", [])) is use_llm
     for report in reports:
         assert report["analysis_completeness"]["is_complete"] is complete
         if complete:
@@ -490,11 +490,11 @@ def test_referenced_table_uncertainty_retains_high_severity_evidence_in_both_pub
     tmp_path: Path, use_llm: bool, successful_llm_transport: list[str]
 ) -> None:
     source = _TABLE_ROWS + "\n\n```sh\nrm -rf /\n```\n"
-    exit_code, mcp, reports = _public_results(
+    exit_code, graph_result, reports = _public_results(
         tmp_path, source, use_llm, True, successful_llm_transport
     )
     assert exit_code == 1
-    assert mcp["safe_to_install"] is False
+    assert graph_result["analysis_completeness"]["is_complete"] is False
     expected_line = source.count("\n", 0, source.index("rm -rf /")) + 1
     for report in reports:
         assert any(

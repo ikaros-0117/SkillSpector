@@ -33,32 +33,10 @@ concurrency:
 env:
   UV_VERSION: "0.10.x"
   PYTHON_VERSION: "3.12"
-  NODE_VERSION: "22.20.0"
   UV_CACHE_DIR: .uv-cache
   UV_LINK_MODE: copy
 
 jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      docker: ${{ steps.filter.outputs.docker }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-      - id: filter
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
-            .dockerignore .github/workflows/ci.yml .gitlab-ci.yml Dockerfile \
-            Makefile pyproject.toml uv.lock src tests/docker tests/fixtures/safe_skill; then
-            echo "docker=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "docker=true" >> "$GITHUB_OUTPUT"
-          fi
-
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -92,39 +70,6 @@ jobs:
       - name: Check isolated dependency inspection before the full suite
         run: uv run pytest -q tests/unit/test_dependency_inspection.py
       - run: uv run make test-ci
-
-  test-opencode:
-    name: OpenCode TypeScript Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Set up Node.js
-        # Pinned to a full commit SHA (third-party action); comment tracks the tag.
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-      - run: node --test tests/opencode/skillspector_scan_lib.test.ts
-      - name: Run Pi extension security tests
-        run: node --test tests/unit/test_pi_extension.mjs
-
-  docker-smoke:
-    needs: changes
-    if: needs.changes.outputs.docker == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: docker version
-      - run: docker info
-      - run: docker build -t skillspector .
-      - run: tests/docker/smoke.sh
-      - if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: docker-smoke-reports
-          path: |
-            .skillspector-docker-smoke.json
-            .skillspector-docker-github-smoke.json
-          if-no-files-found: ignore
 
   dco:
     name: DCO Check

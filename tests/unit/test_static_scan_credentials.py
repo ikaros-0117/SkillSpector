@@ -16,10 +16,10 @@ import pytest
 from typer.testing import CliRunner
 
 from skillspector.cli import app
-from skillspector.mcp_server import run_scan
 from skillspector.nodes.report import _build_metadata
 from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.bedrock import BedrockProvider
+from tests.graph_scan import run_graph_scan
 
 
 @pytest.fixture(params=[False, True], ids=["unbound", "bound"])
@@ -120,19 +120,20 @@ def test_cli_static_scan_never_looks_up_or_executes_aws_credentials(
 
 
 @pytest.mark.parametrize("output_format", ["json", "markdown", "sarif", "terminal"])
-async def test_mcp_static_scan_never_looks_up_or_executes_aws_credentials(
+async def test_graph_static_scan_never_looks_up_or_executes_aws_credentials(
     safe_skill_dir: Path,
     aws_credential_process: tuple[list[object], Path],
     output_format: str,
 ) -> None:
     lookups, marker = aws_credential_process
 
-    result = await run_scan(str(safe_skill_dir), use_llm=False, output_format=output_format)
+    result = await run_graph_scan(str(safe_skill_dir), use_llm=False, output_format=output_format)
 
-    assert result["report"]
+    assert result["report_body"]
     assert result["llm_requested"] is False
-    assert result["llm_available"] is False
-    assert result["scan_mode"] == "static-only"
+    if output_format == "json":
+        metadata = json.loads(result["report_body"])["metadata"]
+        assert metadata["llm_available"] is False
     assert lookups == []
     assert not marker.exists()
 

@@ -57,6 +57,18 @@ def _run_cli(*args: str, provider: str = "nv_build") -> subprocess.CompletedProc
     return _run_python("from skillspector.cli_entry import app; app()", *args, provider=provider)
 
 
+@pytest.mark.parametrize(
+    "invoke",
+    ["from skillspector.cli_entry import app; app()", "from skillspector.cli import app; app()"],
+    ids=["console-script", "implementation"],
+)
+def test_cli_rejects_removed_mcp_subcommand(invoke: str) -> None:
+    result = _run_python(invoke, "mcp")
+
+    assert result.returncode == 2
+    assert "No such command 'mcp'" in result.stderr
+
+
 def _write_skill(path: Path, body: str = "# Helper\n\nFormat a table.\n") -> Path:
     path.mkdir(parents=True)
     (path / "SKILL.md").write_text(body, encoding="utf-8")

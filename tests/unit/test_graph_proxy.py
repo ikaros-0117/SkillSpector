@@ -28,7 +28,6 @@ def _graph_import_state(
     state into other tests.
     """
     monkeypatch.delitem(sys.modules, "skillspector.graph", raising=False)
-    monkeypatch.delitem(sys.modules, "skillspector.mcp_server", raising=False)
     monkeypatch.setattr(skillspector, "graph", lazy_graph, raising=False)
     monkeypatch.setattr(lazy_graph, "_compiled", None, raising=False)
     # A leaked instance attribute would shadow __getattr__ delegation;
@@ -73,13 +72,6 @@ def test_graph_construction_does_not_prepare_a_transport(
         "skillspector.nodes.build_context.prepare_chat_model_imports", unexpected_preparation
     )
     assert skillspector.create_graph() is not None
-
-
-def test_mcp_import_first_preserves_lazy_export(_graph_import_state: None) -> None:
-    """yashrajp22 #436: importing MCP first keeps the lazy export."""
-    importlib.import_module("skillspector.mcp_server")
-    assert isinstance(skillspector.graph, LazyGraph)
-    _assert_graph_export_invokable()
 
 
 def test_direct_submodule_import_keeps_graph_invokable(

@@ -11,7 +11,6 @@ This guide helps developers understand, run, test, and extend the LangGraph-base
 **Entry points** are:
 
 - **CLI** — run `skillspector scan <path-or-url>` (supports Git URL, file URL, .zip, .md file, or directory). Use `--format terminal|json|markdown|sarif`, `--output FILE`, `--no-llm`. See `skillspector --help`.
-- **LangGraph dev server** — run `make langgraph-dev` to start the dev server and open **LangGraph Studio** in your browser. In Studio you can view the graph and run it with custom inputs (e.g. `skill_path`, `output_format`, `use_llm`).
 - **Programmatic** — `from skillspector import graph` and call `graph.invoke(...)` or `graph.stream(...)`.
 
 **Data flow (one sentence):** `resolve_input` (input_path or skill_path → `skill_path`, optional `temp_dir_for_cleanup`) → build context → parallel analyzers → meta_analyzer (LLM filter/enrich when `use_llm` is True) → report (SARIF + risk score + `report_body` from `output_format`). Caller cleans up `temp_dir_for_cleanup` after invoke when set.
@@ -30,7 +29,7 @@ To observe this workflow with a coding agent, use the
 records setup and check results separately from full PR validation.
 
 - **Installation**: `make install` and `make install-dev` use **uv** if available (`uv sync` / `uv sync --all-extras`), otherwise **pip** (`pip install -e .` / `pip install -e ".[dev]"`).
-- **Environment**: Optional `.env` in the project root. The LangGraph dev server loads it (see [langgraph.json](../langgraph.json) `"env": ".env"`). Key variables:
+- **Environment**: Export the variables used by your scan or load an optional `.env` file with `uv run --env-file .env`. Key variables:
   - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Defaults to `nv_build` when unset.
   - **Provider credential**: depends on the active provider. Hosted providers use the matching variables in [.env.example](../.env.example); Ollama and CLI providers do not require an API key. See [providers/](../src/skillspector/providers/).
   - **`OPENAI_BASE_URL`**: Override the OpenAI endpoint (e.g. point at Ollama).
@@ -54,7 +53,6 @@ All targets assume the virtual environment is **already created and activated**.
 | `make help` | Show available targets |
 | `make install` | Install the package in production mode |
 | `make install-dev` | Install the package with development dependencies |
-| `make langgraph-dev` | Run LangGraph dev server (opens Studio at `LANGGRAPH_STUDIO_URL`) |
 | `make test-unit` | Initial test selection: excludes `integration` and `provider` markers |
 | `make test-integration` | Full-graph integration tests; may call a configured LLM provider |
 | `make test` | Run `test-unit` and `test-integration`; the current contributor submission requirement |
@@ -176,15 +174,6 @@ There are no conditional edges: after `resolve_input` → `build_context`, all a
 
 ## 6. Running the workflow
 
-### LangGraph dev server (primary for development)
-
-Running `make langgraph-dev` starts the LangGraph dev server and opens **LangGraph Studio** in your browser (the Studio URL is configurable via the `LANGGRAPH_STUDIO_URL` variable in the [Makefile](../Makefile); defaults to public LangSmith). In Studio you can:
-
-- **View the graph** — See the workflow as a diagram: nodes (resolve_input, build_context, analyzers, meta_analyzer, report) and edges. Useful for understanding flow and debugging.
-- **Run the graph interactively** — Select the `skillspector_scan` graph, provide an input (e.g. `{"input_path": "/path/to/your/skill"}` or `{"skill_path": "/path/to/your/skill"}`), and execute a run. You can inspect state after each step and see the final `sarif_report` and `risk_score`.
-
-**Setup**: [langgraph.json](../langgraph.json) defines the graph `skillspector_scan` at `./src/skillspector/graph.py:graph` and loads `.env`. Provide **`input_path`** (URL, zip, file, or directory) or **`skill_path`** (local directory). If the graph resolves a URL/zip/file, it sets `temp_dir_for_cleanup`; the caller should clean up that directory after invoke.
-
 ### CLI
 
 After creating/activating the venv and running `make install-dev` (or `pip install -e ".[dev]"`), the **skillspector** CLI is available:
@@ -243,7 +232,6 @@ has checks suited to its environment.
 | Unit tests | Non-integration, non-provider tests with coverage | The same unit-test set with Cobertura coverage artifacts |
 | Integration tests | Not run | Full-graph integration suite; these tests may call configured LLM providers |
 | Live provider tests | Not run | Optional manual tests against OpenAI, Anthropic, and NVIDIA Build using masked CI credentials |
-| Docker smoke test | Runs when Docker- or application-related files change and uploads smoke reports | Runs for the same categories of changes with Docker-in-Docker and preserves smoke reports |
 | Static analysis | OpenSSF Scorecard runs in a separate public workflow | SonarQube runs after unit tests and is currently non-blocking |
 | Contribution policy | DCO sign-off check on pull requests | No separate DCO job |
 | Automated review | No review bot job is defined in the workflow | CodeRabbit is connected through an external integration/webhook, not a runner job |
@@ -296,7 +284,7 @@ Return `{"findings": []}`. All analyzer nodes are currently implemented; use thi
 
 ### .env
 
-Copy [.env.example](../.env.example) to `.env` in the project root and set values as needed. The LangGraph dev server loads `.env` (see [langgraph.json](../langgraph.json)).
+To use an environment file, copy [.env.example](../.env.example) to `.env` in the project root, set values as needed, and run `uv run --env-file .env skillspector scan <path>`.
 
 | Variable | Description | Example |
 |----------|-------------|---------|
@@ -379,7 +367,7 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
 | Task | Command or action |
 |------|-------------------|
 | **Get started** | Follow the [README development setup](../README.md#setup). Re-activate the virtual environment in each new terminal. |
-| **Run workflow** | `skillspector scan <path>` for CLI; `make langgraph-dev` for LangGraph Studio; or `graph.invoke({"input_path": "...", "output_format": "json"})` (or `skill_path`) programmatically |
+| **Run workflow** | `skillspector scan <path>` for CLI or `graph.invoke({"input_path": "...", "output_format": "json"})` (or `skill_path`) programmatically |
 | **Add analyzer** | Implement node returning `{"findings": list[Finding]}`, register in `nodes/analyzers/__init__.py` |
 | **Initial checks** | `make test-unit`, `make lint`, `make format-check`; see [Testing](#7-testing) for scope |
 | **Full contributor tests** | `make test` includes integration tests that may call a configured LLM provider; review [Testing](#7-testing) and provider prerequisites first |

@@ -16,11 +16,11 @@ import skillspector.nodes.build_context as build_context_module
 import skillspector.state as state_module
 from skillspector.cli import app
 from skillspector.graph import graph
-from skillspector.mcp_server import run_scan
 from skillspector.models import Finding
 from skillspector.nodes.analyzers import artifact_integrity, static_runner
 from skillspector.nodes.report import _compute_risk_score
 from skillspector.nodes.report import report as render_report
+from tests.graph_scan import run_graph_scan
 
 
 def _write_bundle(root: Path, files: dict[str, str | bytes]) -> None:
@@ -231,22 +231,20 @@ async def _assert_rules_across_public_surfaces(
         assert parsed["risk_assessment"]["recommendation"] == expected_recommendation
         assert parsed["analysis_completeness"]["is_complete"] is True
 
-    verdict = await run_scan(str(root), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(root), use_llm=False, output_format="json")
     for rule_id, paths in expected_locations.items():
         observed_occurrences = {
             occurrence["file"]
-            for finding in verdict["findings"]
-            if finding["id"] == rule_id
-            for occurrence in finding["occurrences"]
+            for finding in verdict["filtered_findings"]
+            if finding.rule_id == rule_id
+            for occurrence in finding.occurrences
         }
         observed_locations = {
-            finding["location"]["file"]
-            for finding in verdict["findings"]
-            if finding["id"] == rule_id
+            finding.file for finding in verdict["filtered_findings"] if finding.rule_id == rule_id
         }
         assert paths <= observed_occurrences | observed_locations
     assert verdict["risk_score"] == expected_score
-    assert verdict["recommendation"] == expected_recommendation
+    assert verdict["risk_recommendation"] == expected_recommendation
     assert verdict["analysis_completeness"]["is_complete"] is True
 
 
@@ -318,14 +316,14 @@ async def _assert_incomplete_across_public_surfaces(
             sc9 = next(issue for issue in parsed["issues"] if issue["id"] == "SC9")
             assert sc9["evidence"]["excluded_inspection_incomplete"] is True
 
-    verdict = await run_scan(str(root), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(root), use_llm=False, output_format="json")
     assert verdict["risk_score"] == expected_score
-    assert verdict["recommendation"] == expected_recommendation
+    assert verdict["risk_recommendation"] == expected_recommendation
     assert verdict["analysis_completeness"]["is_complete"] is False
-    assert verdict["safe_to_install"] is False
+
     if expect_sc9:
-        sc9 = next(finding for finding in verdict["findings"] if finding["id"] == "SC9")
-        assert sc9["evidence"]["excluded_inspection_incomplete"] is True
+        sc9 = next(finding for finding in verdict["filtered_findings"] if finding.rule_id == "SC9")
+        assert sc9.evidence["excluded_inspection_incomplete"] is True
 
 
 @pytest.mark.parametrize(
@@ -797,8 +795,8 @@ async def test_complete_match_payload_is_bounded_across_public_surfaces(tmp_path
             body = MarkdownIt().enable("table").render(body)
         assert payload_tail not in body
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    assert payload_tail not in json.dumps(verdict, sort_keys=True)
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+    assert payload_tail not in verdict["report_body"]
 
 
 @pytest.mark.asyncio
@@ -1022,11 +1020,12 @@ async def test_letter_spaced_p3_p4_are_install_unsafe_without_llm(
         assert {semantic_rule, "AE6"} <= {issue["id"] for issue in cli_report["issues"]}
         assert cli_report["analysis_completeness"]["is_complete"] is False
         assert cli_report["risk_assessment"]["recommendation"] != "SAFE"
-        verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-        assert {semantic_rule, "AE6"} <= {finding["id"] for finding in verdict["findings"]}
+        verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+        assert {semantic_rule, "AE6"} <= {
+            finding.rule_id for finding in verdict["filtered_findings"]
+        }
         assert verdict["analysis_completeness"]["is_complete"] is False
-        assert verdict["recommendation"] != "SAFE"
-        assert verdict["safe_to_install"] is False
+        assert verdict["risk_recommendation"] != "SAFE"
 
 
 @pytest.mark.asyncio
@@ -1255,10 +1254,9 @@ Visit https://example.invalid/docs and use state-of-the-art formatting. 🌤️
     assert result["risk_recommendation"] == "SAFE"
     assert result["analysis_completeness"]["is_complete"] is True
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    assert verdict["recommendation"] == "SAFE"
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+    assert verdict["risk_recommendation"] == "SAFE"
     assert verdict["analysis_completeness"]["is_complete"] is True
-    assert verdict["safe_to_install"] is True
 
 
 @pytest.mark.asyncio
@@ -1282,10 +1280,9 @@ async def test_standalone_algebraic_security_word_remains_safe(
     assert result["risk_recommendation"] == "SAFE"
     assert result["analysis_completeness"]["is_complete"] is True
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    assert verdict["recommendation"] == "SAFE"
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+    assert verdict["risk_recommendation"] == "SAFE"
     assert verdict["analysis_completeness"]["is_complete"] is True
-    assert verdict["safe_to_install"] is True
 
 
 @pytest.mark.asyncio
@@ -1333,11 +1330,10 @@ async def test_plus_obfuscation_outside_exact_ascii_control_fails_closed(
     assert result["risk_recommendation"] != "SAFE"
     assert result["analysis_completeness"]["is_complete"] is False
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    assert any(finding["id"] == "AE6" for finding in verdict["findings"])
-    assert verdict["recommendation"] != "SAFE"
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+    assert any(finding.rule_id == "AE6" for finding in verdict["filtered_findings"])
+    assert verdict["risk_recommendation"] != "SAFE"
     assert verdict["analysis_completeness"]["is_complete"] is False
-    assert verdict["safe_to_install"] is False
 
 
 @pytest.mark.asyncio
@@ -1758,13 +1754,12 @@ def test_runtime_selected_command_cli_honors_fail_on_incomplete(
 
 
 @pytest.mark.asyncio
-async def test_runtime_selected_command_mcp_is_not_install_safe(
+async def test_async_graph_keeps_runtime_selected_command_incomplete(
     runtime_command_bundle: Path,
 ) -> None:
-    verdict = await run_scan(str(runtime_command_bundle), use_llm=False, output_format="json")
+    verdict = await run_graph_scan(str(runtime_command_bundle), use_llm=False, output_format="json")
 
-    assert verdict["safe_to_install"] is False
-    assert verdict["recommendation"] == "CAUTION"
+    assert verdict["risk_recommendation"] == "CAUTION"
     assert verdict["analysis_completeness"]["status"] == "partial"
     assert verdict["analysis_completeness"]["execution_successful"] is True
 
@@ -1790,8 +1785,6 @@ async def test_runtime_parameter_documentation_remains_install_safe(tmp_path: Pa
     await _assert_rules_across_public_surfaces(
         tmp_path, expected_locations={}, python_result=result
     )
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    assert verdict["safe_to_install"] is True
 
 
 def test_markdown_reference_to_parser_limited_target_keeps_cli_execution_successful(
@@ -1893,10 +1886,10 @@ async def test_changed_rule_family_negative_controls(tmp_path: Path) -> None:
     assert cli_report["risk_assessment"]["score"] == result["risk_score"]
     assert cli_report["risk_assessment"]["recommendation"] == result["risk_recommendation"]
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    assert forbidden.isdisjoint(item["id"] for item in verdict["findings"])
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+    assert forbidden.isdisjoint(item.rule_id for item in verdict["filtered_findings"])
     assert verdict["risk_score"] == result["risk_score"]
-    assert verdict["recommendation"] == result["risk_recommendation"]
+    assert verdict["risk_recommendation"] == result["risk_recommendation"]
 
 
 @pytest.mark.asyncio
@@ -1928,8 +1921,8 @@ async def test_static_only_finding_contract_across_public_surfaces(tmp_path: Pat
     assert cli_result.exit_code == 0
     assert '"id": "P1"' in cli_result.output
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    assert any(item["id"] == "P1" for item in verdict["findings"])
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+    assert any(item.rule_id == "P1" for item in verdict["filtered_findings"])
     assert verdict["analysis_completeness"]["is_complete"] is True
 
 
@@ -1990,13 +1983,12 @@ async def test_ae1_and_incomplete_coverage_contract_across_public_surfaces(
     assert '"id": "AE1"' in strict_cli.output
     assert '"id": "SC9"' in strict_cli.output
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    assert any(item["id"] == "AE1" for item in verdict["findings"])
-    sc9 = next(item for item in verdict["findings"] if item["id"] == "SC9")
-    assert sc9["evidence"]["excluded_from_analysis"] is True
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+    assert any(item.rule_id == "AE1" for item in verdict["filtered_findings"])
+    sc9 = next(item for item in verdict["filtered_findings"] if item.rule_id == "SC9")
+    assert sc9.evidence["excluded_from_analysis"] is True
     assert verdict["risk_score"] == expected_score
-    assert verdict["recommendation"] == "DO_NOT_INSTALL"
-    assert verdict["safe_to_install"] is False
+    assert verdict["risk_recommendation"] == "DO_NOT_INSTALL"
 
 
 @pytest.mark.asyncio
@@ -2104,6 +2096,5 @@ async def test_privileged_payload_in_referenced_reference_file_stays_install_uns
     assert default_cli.exit_code == 1, default_cli.output
     assert json.loads(default_cli.output)["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
 
-    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    assert verdict["recommendation"] == "DO_NOT_INSTALL"
-    assert verdict["safe_to_install"] is False
+    verdict = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+    assert verdict["risk_recommendation"] == "DO_NOT_INSTALL"

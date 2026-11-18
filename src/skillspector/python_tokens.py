@@ -60,8 +60,8 @@ PythonLiteralSpans = tuple[tuple[int, ...], tuple[int, ...]]
 #
 # The consumers run in different analyzer nodes (the marker pass in every
 # static-pattern node). The graph starts all analyzer nodes together on worker
-# threads; the CLI and MCP server set no ``max_concurrency``, so the pool has
-# Python's default size, min(32, CPUs + 4). Every node walks the components in
+# threads; the CLI uses the default executor size without ``max_concurrency``.
+# Every node walks the components in
 # the same order but at its own pace, so requests for other modules arrive
 # between a module's first and last consumer. An entry holds one module however
 # many consumers ask, so eight entries keep a result while up to seven other

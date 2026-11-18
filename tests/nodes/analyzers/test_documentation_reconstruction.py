@@ -17,10 +17,10 @@ from typer.testing import CliRunner
 from skillspector import security_reconstruction as reconstruction
 from skillspector.cli import app
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.mcp_server import run_scan
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
 from skillspector.security_reconstruction import MAX_MARKER_LOOKAHEAD_CHARS
+from tests.graph_scan import run_graph_scan
 
 
 @pytest.fixture
@@ -51,13 +51,11 @@ def successful_llm_transport(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     factory = MagicMock(side_effect=lambda **_kwargs: ChatModel())
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", factory)
-    monkeypatch.setattr("skillspector.mcp_server.is_llm_available", lambda: (True, ""))
     graph_module = importlib.import_module("skillspector.graph")
     monkeypatch.setattr(graph_module, "is_llm_available", lambda: (True, ""))
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, ""))
     scan_graph = graph_module.create_graph()
     monkeypatch.setattr("skillspector.cli.graph", scan_graph)
-    monkeypatch.setattr("skillspector.mcp_server.graph", scan_graph)
     return calls
 
 
@@ -261,10 +259,10 @@ def test_incomplete_documentation_cannot_be_certified_safe(
     assert report["risk_assessment"]["recommendation"] != "SAFE"
     _assert_llm_mode(report, use_llm, successful_llm_transport)
     successful_llm_transport.clear()
-    mcp_result = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
-    assert mcp_result["safe_to_install"] is False
-    assert mcp_result["llm_used"] is use_llm
-    _assert_llm_mode(json.loads(mcp_result["report"]), use_llm, successful_llm_transport)
+    graph_result = asyncio.run(run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+
+    assert any(call.get("ok") is True for call in graph_result.get("llm_call_log", [])) is use_llm
+    _assert_llm_mode(json.loads(graph_result["report_body"]), use_llm, successful_llm_transport)
 
 
 @pytest.mark.parametrize("width", [3, 4, 12])
@@ -540,14 +538,14 @@ def test_documentation_json_and_block_boundaries_through_public_gates(
     cli_report = json.loads(cli_result.output)
     _assert_llm_mode(cli_report, use_llm, successful_llm_transport)
     successful_llm_transport.clear()
-    mcp_result = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
-    mcp_report = json.loads(mcp_result["report"])
-    _assert_llm_mode(mcp_report, use_llm, successful_llm_transport)
+    graph_result = asyncio.run(run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+    graph_report = json.loads(graph_result["report_body"])
+    _assert_llm_mode(graph_report, use_llm, successful_llm_transport)
 
     assert cli_result.exit_code == (0 if complete else 1), cli_result.output
-    assert mcp_result["safe_to_install"] is complete
-    assert mcp_result["llm_used"] is use_llm
-    for report in (cli_report, mcp_report):
+
+    assert any(call.get("ok") is True for call in graph_result.get("llm_call_log", [])) is use_llm
+    for report in (cli_report, graph_report):
         assert report["analysis_completeness"]["is_complete"] is complete
         if complete:
             assert report["analysis_completeness"]["coverage_percent"] == 100.0
@@ -588,15 +586,15 @@ def test_entrypoint_json_is_complete_without_suppressing_other_findings(
     cli_report = json.loads(cli_result.output)
     _assert_llm_mode(cli_report, use_llm, successful_llm_transport)
     successful_llm_transport.clear()
-    mcp_result = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
-    mcp_report = json.loads(mcp_result["report"])
-    _assert_llm_mode(mcp_report, use_llm, successful_llm_transport)
+    graph_result = asyncio.run(run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+    graph_report = json.loads(graph_result["report_body"])
+    _assert_llm_mode(graph_report, use_llm, successful_llm_transport)
 
     assert cli_result.exit_code == 0, cli_result.output
     # Complete inspection retains the existing risk score and findings. This
-    # fixture's score remains below the unchanged MCP installation threshold.
-    assert mcp_result["safe_to_install"] is True
-    for report in (cli_report, mcp_report):
+    # fixture's score remains below the CLI's blocking threshold.
+
+    for report in (cli_report, graph_report):
         assert report["analysis_completeness"]["is_complete"] is True
         assert report["analysis_completeness"]["coverage_percent"] == 100.0
         assert {"P9", "YR4"} <= {issue["id"] for issue in report["issues"]}

@@ -167,13 +167,6 @@ class FormatChoice(StrEnum):
 _MACHINE_READABLE_FORMATS = frozenset({FormatChoice.json, FormatChoice.sarif})
 
 
-class TransportChoice(StrEnum):
-    """Transport choices for the MCP server."""
-
-    stdio = "stdio"
-    http = "http"
-
-
 @dataclass(slots=True)
 class _TransitiveBudget:
     max_targets: int = _TRANSITIVE_MAX_TARGETS
@@ -3509,52 +3502,6 @@ def _scan_multi_skill(
         raise typer.Exit(code=1)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
-
-
-@app.command()
-def mcp(
-    transport: Annotated[
-        TransportChoice,
-        typer.Option(
-            "--transport",
-            "-t",
-            help="Transport: FastMCP stdio for local CLI agents, http for loopback HTTP clients.",
-            case_sensitive=False,
-        ),
-    ] = TransportChoice.stdio,
-    host: Annotated[
-        str,
-        typer.Option(
-            "--host", help="Loopback IP to bind (http transport only; localhost is accepted)."
-        ),
-    ] = "127.0.0.1",
-    port: Annotated[
-        int,
-        typer.Option("--port", help="Port to bind (http transport only)."),
-    ] = 8000,
-) -> None:
-    """
-    Run SkillSpector as an MCP server.
-
-    Exposes a single tool, ``scan_skill``, so any MCP-capable agent (Claude Code,
-    Codex CLI, Gemini CLI) can scan a skill locally and gate installs
-    on the verdict.
-
-    Requires the optional mcp extra. Reinstall the GitHub tool package with
-    that extra enabled, as shown in the README Quick Start section.
-
-    Examples:
-
-        skillspector mcp                      # FastMCP stdio for local CLI agents
-        skillspector mcp --transport http --port 8000
-    """
-    try:
-        from skillspector.mcp_server import run as run_mcp
-
-        run_mcp(transport=transport.value, host=host, port=port)
-    except (ModuleNotFoundError, ValueError) as e:
-        err_console.print(_error_line(e))
-        raise typer.Exit(code=2) from e
 
 
 @app.command()

@@ -54,8 +54,8 @@ def restore_package_graph_export() -> None:
 
     Importing the ``skillspector.graph`` submodule assigns the module object
     to the parent package's ``graph`` attribute, shadowing this proxy. Call
-    this after any eager submodule import (the ``create_graph()`` factory
-    wrapper, ``mcp_server``) so ``skillspector.graph`` stays invokable
+    this after an eager submodule import, as the ``create_graph()`` factory
+    does, so ``skillspector.graph`` stays invokable
     regardless of import order.
     """
     import skillspector as _pkg

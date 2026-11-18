@@ -13,9 +13,9 @@ from typer.testing import CliRunner
 
 from skillspector import references as references_module
 from skillspector.cli import app
-from skillspector.mcp_server import run_scan
 from skillspector.references import resolve_bundle_references_with_metadata
 from skillspector.sarif_models import validate_sarif_report
+from tests.graph_scan import run_graph_scan
 
 
 @pytest.mark.parametrize(
@@ -89,7 +89,7 @@ def test_reference_definitions_do_not_restore_slash_prose_false_positives(tmp_pa
     assert result.records == []
 
 
-@pytest.mark.parametrize("channel", ["cli", "mcp"])
+@pytest.mark.parametrize("channel", ["cli", "graph"])
 @pytest.mark.parametrize("present", [True, False])
 @pytest.mark.parametrize(
     ("body", "target"),
@@ -108,7 +108,7 @@ def test_reference_definitions_do_not_restore_slash_prose_false_positives(tmp_pa
         ('[guide]: docs/guide.md "see docs/missing.md"', "docs/guide.md"),
     ],
 )
-async def test_cli_and_mcp_reference_completeness_agree(
+async def test_cli_and_graph_reference_completeness_agree(
     tmp_path: Path, body: str, target: str, present: bool, channel: str
 ) -> None:
     if "<" in target and os.name == "nt":
@@ -128,9 +128,9 @@ async def test_cli_and_mcp_reference_completeness_agree(
         assert result.exit_code == 0, result.output
         report = json.loads(result.stdout)
     else:
-        result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-        assert result["safe_to_install"] is True
-        report = json.loads(result["report"])
+        result = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+
+        report = json.loads(result["report_body"])
     assert report["execution_successful"] is True
     completeness = report["analysis_completeness"]
     assert completeness["is_complete"] is True
@@ -201,9 +201,9 @@ async def test_numeric_extension_reference_retains_uninspected_artifact_gap(
             "SAAAAABJRU5ErkJggg=="
         )
     )
-    result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-    report = json.loads(result["report"])
-    assert result["safe_to_install"] is False
+    result = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+    report = json.loads(result["report_body"])
+
     assert report["analysis_completeness"]["is_complete"] is False
     assert any(r["target_path"] == target for r in report["analysis_completeness"]["references"])
     assert any(finding["id"] == "AE1" for finding in report["issues"])
@@ -366,7 +366,7 @@ def test_title_text_is_not_a_reference(tmp_path: Path, template: str, title: str
     ]
 
 
-@pytest.mark.parametrize("channel", ["cli", "mcp"])
+@pytest.mark.parametrize("channel", ["cli", "graph"])
 @pytest.mark.parametrize(
     "body",
     [
@@ -389,8 +389,8 @@ async def test_markdown_limits_block_complete_verdict(
         assert result.exit_code == 1, result.output
         report = json.loads(result.stdout)
     else:
-        result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
-        assert result["safe_to_install"] is False
-        report = json.loads(result["report"])
+        result = await run_graph_scan(str(tmp_path), use_llm=False, output_format="json")
+
+        report = json.loads(result["report_body"])
     assert report["execution_successful"] is True
     assert report["analysis_completeness"]["is_complete"] is False

@@ -6,15 +6,14 @@
 from __future__ import annotations
 
 import json
-from importlib import import_module
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pydantic import BaseModel
 
-import skillspector.mcp_server as mcp_server
 from skillspector.inspection_ledger import LedgerReason
+from tests.graph_scan import run_graph_scan
 
 
 @pytest.mark.parametrize("use_llm", [False, True], ids=["no-llm", "llm"])
@@ -22,7 +21,6 @@ from skillspector.inspection_ledger import LedgerReason
 async def test_json_quotes_preserve_public_verdict_across_scan_modes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_llm: bool, case: str
 ) -> None:
-    graph_module = import_module("skillspector.graph")
     transports: list[MagicMock] = []
 
     def structured_output(schema: type[BaseModel]) -> MagicMock:
@@ -40,12 +38,7 @@ async def test_json_quotes_preserve_public_verdict_across_scan_modes(
     model.with_structured_output.side_effect = structured_output
     get_chat_model = MagicMock(return_value=model)
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", get_chat_model)
-    monkeypatch.setattr(graph_module, "is_llm_available", lambda: (True, None))
-    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
-    # Availability must be established before graph construction so all real
-    # semantic nodes are wired, including in the paired disabled-mode run.
-    monkeypatch.setattr(mcp_server, "graph", graph_module.create_graph())
 
     if case == "placeholder":
         document = {
@@ -66,17 +59,16 @@ async def test_json_quotes_preserve_public_verdict_across_scan_modes(
     )
     (tmp_path / "SKILL.md").write_text(content, encoding="utf-8")
 
-    verdict = await mcp_server.run_scan(str(tmp_path), use_llm=use_llm, output_format="json")
+    verdict = await run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json")
 
-    report = json.loads(verdict["report"])
+    report = json.loads(verdict["report_body"])
     metadata = report["metadata"]
     completed_requests = sum(
         transport.invoke.call_count + transport.ainvoke.await_count for transport in transports
     )
     assert verdict["execution_successful"] is True
     assert verdict["llm_requested"] is use_llm
-    assert verdict["llm_used"] is use_llm
-    assert verdict["scan_mode"] == ("static+llm" if use_llm else "static-only")
+    assert any(call.get("ok") is True for call in verdict.get("llm_call_log", [])) is use_llm
     if use_llm:
         assert completed_requests >= 3
         assert metadata["llm_calls_attempted"] == completed_requests
@@ -89,7 +81,9 @@ async def test_json_quotes_preserve_public_verdict_across_scan_modes(
         assert metadata.get("llm_calls_succeeded", 0) == 0
 
     completeness = verdict["analysis_completeness"]
-    tm1 = [finding for finding in verdict["findings"] if finding["id"] == "TM1"]
+    tm1 = [
+        finding.to_dict() for finding in verdict["filtered_findings"] if finding.rule_id == "TM1"
+    ]
     if case == "instruction":
         assert len(tm1) == 1
         assert tm1[0]["location"] == {
@@ -100,7 +94,7 @@ async def test_json_quotes_preserve_public_verdict_across_scan_modes(
         }
         assert "declared-marker-view" in tm1[0]["tags"]
         assert completeness["is_complete"] is True
-        assert verdict["recommendation"] != "SAFE"
+        assert verdict["risk_recommendation"] != "SAFE"
         assert any(issue["id"] == "TM1" for issue in report["issues"])
     elif case == "unsupported":
         assert tm1 == []
@@ -109,8 +103,8 @@ async def test_json_quotes_preserve_public_verdict_across_scan_modes(
             exception["reason_code"] == LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
             for exception in completeness["ledger_exceptions"]
         )
-        assert verdict["safe_to_install"] is False
-        assert verdict["recommendation"] != "SAFE"
+
+        assert verdict["risk_recommendation"] != "SAFE"
         assert report["risk_assessment"]["recommendation"] != "SAFE"
     elif case == "escaped-quotes":
         # Validated JSON keys own their closing quotes too. The deliberately
@@ -118,13 +112,12 @@ async def test_json_quotes_preserve_public_verdict_across_scan_modes(
         # correcting structural ownership must not remove that evidence. Its
         # remaining advisory score is below the unchanged installation limit.
         assert tm1 == []
-        assert any(finding["id"] == "MP2" for finding in verdict["findings"])
+        assert any(finding.rule_id == "MP2" for finding in verdict["filtered_findings"])
         assert completeness["is_complete"] is True
         assert completeness["ledger_exceptions"] == []
-        assert verdict["safe_to_install"] is True
-        assert verdict["recommendation"] == "SAFE"
+
+        assert verdict["risk_recommendation"] == "SAFE"
     else:
-        assert verdict["findings"] == []
+        assert verdict["filtered_findings"] == []
         assert completeness["is_complete"] is True
-        assert verdict["recommendation"] == "SAFE"
-        assert verdict["safe_to_install"] is True
+        assert verdict["risk_recommendation"] == "SAFE"

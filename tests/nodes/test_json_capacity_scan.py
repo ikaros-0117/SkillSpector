@@ -19,7 +19,7 @@ from skillspector.inspection_ledger import (
     _exception_from_event,
     ledger_event,
 )
-from skillspector.mcp_server import run_scan
+from tests.graph_scan import run_graph_scan
 from tests.nodes.analyzers.test_documentation_reconstruction import _assert_llm_mode
 from tests.nodes.analyzers.test_documentation_reconstruction import (
     successful_llm_transport as successful_llm_transport,
@@ -28,7 +28,7 @@ from tests.nodes.analyzers.test_documentation_reconstruction import (
 
 @pytest.mark.parametrize("use_llm", [False, True], ids=["static", "semantic"])
 @pytest.mark.parametrize("size", [65535, 65536, 65537, 74978, 131071, 131072, 131073])
-def test_capacity_preserves_cli_mcp_gates(
+def test_capacity_preserves_cli_and_graph_completeness(
     tmp_path: Path, use_llm: bool, size: int, successful_llm_transport: list[str]
 ) -> None:
     # A compact synthetic object with unique records avoids context-stuffing
@@ -63,13 +63,13 @@ def test_capacity_preserves_cli_mcp_gates(
     cli = CliRunner().invoke(app, args)
     cli_calls = list(successful_llm_transport)
     successful_llm_transport.clear()
-    mcp = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+    graph_result = asyncio.run(run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
     complete = size <= 131072
     assert cli.exit_code == (0 if complete else 1), cli.output
-    assert mcp["safe_to_install"] is complete
+
     for report, calls in [
         (json.loads(cli.output), cli_calls),
-        (json.loads(mcp["report"]), successful_llm_transport),
+        (json.loads(graph_result["report_body"]), successful_llm_transport),
     ]:
         _assert_llm_mode(report, use_llm, calls)
         assert report["execution_successful"] is True

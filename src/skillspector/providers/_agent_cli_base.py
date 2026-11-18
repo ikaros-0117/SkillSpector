@@ -75,8 +75,8 @@ class AgentCLIProviderBase:
         """Binary on PATH AND authenticated (delegates to the registry probe).
 
         Warns once per process when the CLI is usable (see
-        :meth:`warn_session_cost`), so callers that probe up front, such as
-        the MCP server, warn before any scan starts.
+        :meth:`warn_session_cost`), so callers that probe up front can warn
+        before a scan starts.
         """
         available, error = _agent_cli.is_available(self.BINARY_NAME)
         if available:

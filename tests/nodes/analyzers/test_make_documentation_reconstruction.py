@@ -14,9 +14,9 @@ from typer.testing import CliRunner
 
 from skillspector.cli import app
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.mcp_server import run_scan
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
+from tests.graph_scan import run_graph_scan
 from tests.nodes.analyzers.test_documentation_reconstruction import _assert_llm_mode
 from tests.nodes.analyzers.test_documentation_reconstruction import (
     successful_llm_transport as successful_llm_transport,
@@ -157,13 +157,13 @@ def test_repeated_make_documentation_references_keep_honest_public_verdicts(
     cli_report = json.loads(cli_result.output)
     _assert_llm_mode(cli_report, use_llm, successful_llm_transport)
     successful_llm_transport.clear()
-    mcp_result = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
-    mcp_report = json.loads(mcp_result["report"])
-    _assert_llm_mode(mcp_report, use_llm, successful_llm_transport)
-    assert mcp_result["safe_to_install"] is complete
-    assert mcp_result["llm_used"] is use_llm
+    graph_result = asyncio.run(run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+    graph_report = json.loads(graph_result["report_body"])
+    _assert_llm_mode(graph_report, use_llm, successful_llm_transport)
 
-    for report in (cli_report, mcp_report):
+    assert any(call.get("ok") is True for call in graph_result.get("llm_call_log", [])) is use_llm
+
+    for report in (cli_report, graph_report):
         coverage = report["analysis_completeness"]
         assert coverage["is_complete"] is complete
         assert coverage["entirely_uninspected_files"] == 0

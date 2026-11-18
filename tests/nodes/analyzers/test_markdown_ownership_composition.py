@@ -18,9 +18,9 @@ from typer.testing import CliRunner
 
 from skillspector.cli import app
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.mcp_server import run_scan
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
+from tests.graph_scan import run_graph_scan
 from tests.nodes.analyzers.test_documentation_reconstruction import _assert_llm_mode
 from tests.nodes.analyzers.test_documentation_reconstruction import (
     successful_llm_transport as successful_llm_transport,
@@ -90,11 +90,14 @@ def test_table_and_json_composition_reaches_both_public_gates(
     cli = CliRunner().invoke(app, args)
     cli_calls = list(successful_llm_transport)
     successful_llm_transport.clear()
-    mcp = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
-    mcp_calls = list(successful_llm_transport)
+    graph_result = asyncio.run(run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+    graph_calls = list(successful_llm_transport)
     assert cli.exception is None or isinstance(cli.exception, SystemExit)
     assert cli.exit_code in (0, 1), cli.output
-    reports = [(json.loads(cli.output), cli_calls), (json.loads(mcp["report"]), mcp_calls)]
+    reports = [
+        (json.loads(cli.output), cli_calls),
+        (json.loads(graph_result["report_body"]), graph_calls),
+    ]
     # Both interfaces execute before correctness assertions, even in the red phase.
     for report, calls in reports:
         _assert_llm_mode(report, use_llm, calls)
@@ -123,9 +126,9 @@ def test_table_and_json_composition_reaches_both_public_gates(
                 assert status["completed"] == status["planned_work"] > 0
             else:
                 assert status["completed"] == status["planned_work"] == 0
-    assert mcp["llm_used"] is use_llm
+    assert any(call.get("ok") is True for call in graph_result.get("llm_call_log", [])) is use_llm
     assert cli.exit_code == (0 if complete else 1), cli.output
-    assert mcp["safe_to_install"] is complete
+
     for report, _ in reports:
         coverage = report["analysis_completeness"]
         assert coverage["is_complete"] is complete

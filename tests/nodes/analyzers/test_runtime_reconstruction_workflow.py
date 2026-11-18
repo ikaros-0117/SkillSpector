@@ -15,7 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from skillspector.cli import app
-from skillspector.mcp_server import run_scan
+from tests.graph_scan import run_graph_scan
 
 
 @pytest.fixture
@@ -46,13 +46,11 @@ def successful_llm_transport(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     factory = MagicMock(side_effect=lambda **_kwargs: ChatModel())
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", factory)
-    monkeypatch.setattr("skillspector.mcp_server.is_llm_available", lambda: (True, ""))
     graph_module = importlib.import_module("skillspector.graph")
     monkeypatch.setattr(graph_module, "is_llm_available", lambda: (True, ""))
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, ""))
     scan_graph = graph_module.create_graph()
     monkeypatch.setattr("skillspector.cli.graph", scan_graph)
-    monkeypatch.setattr("skillspector.mcp_server.graph", scan_graph)
     return calls
 
 
@@ -100,7 +98,7 @@ def test_runtime_reconstruction_stays_incomplete_with_semantic_analysis(
     assert report["risk_assessment"]["recommendation"] != "SAFE"
     _assert_llm_mode(report, use_llm, successful_llm_transport)
     successful_llm_transport.clear()
-    mcp = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
-    assert mcp["safe_to_install"] is False
-    assert mcp["llm_used"] is use_llm
-    _assert_llm_mode(json.loads(mcp["report"]), use_llm, successful_llm_transport)
+    graph_result = asyncio.run(run_graph_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
+
+    assert any(call.get("ok") is True for call in graph_result.get("llm_call_log", [])) is use_llm
+    _assert_llm_mode(json.loads(graph_result["report_body"]), use_llm, successful_llm_transport)
